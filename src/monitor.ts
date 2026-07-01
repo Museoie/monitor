@@ -41,6 +41,18 @@ const ALARM_COOLDOWN_MS = parseInt(process.env.ALARM_COOLDOWN_MS ?? "60000", 10)
 const LOG_PORT = parseInt(process.env.LOG_PORT ?? "9000", 10);
 const DOCKER_SOCKET = process.env.DOCKER_SOCKET ?? "/var/run/docker.sock";
 const JOURNALCTL_BIN = process.env.JOURNALCTL_BIN ?? "journalctl";
+const STATS_POLL_INTERVAL_MS = parseInt(
+  process.env.STATS_POLL_INTERVAL_MS ?? "60000",
+  10
+);
+const STATS_HISTORY_SIZE = parseInt(process.env.STATS_HISTORY_SIZE ?? "60", 10);
+const MEMORY_PRESSURE_RATIO = parseFloat(
+  process.env.MEMORY_PRESSURE_RATIO ?? "0.85"
+);
+const MEMORY_PRESSURE_SUSTAINED = parseInt(
+  process.env.MEMORY_PRESSURE_SUSTAINED ?? "3",
+  10
+);
 
 // ---------------------------------------------------------------------------
 // Docker socket helpers
@@ -222,6 +234,126 @@ async function pollHealth(): Promise<void> {
     } catch (e: unknown) {
       const msg = e instanceof Error ? e.message : String(e);
       console.error(`[health] poll failed for ${name}:`, msg);
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Container memory / CPU stats polling
+// ---------------------------------------------------------------------------
+
+/**
+ * Snapshot of one docker stats sample, distilled to the fields we actually
+ * use for triage. `usage_bytes` and `limit_bytes` come from `memory_stats`
+ * exactly as Docker reports them; `usage_ratio` is precomputed so callers
+ * don't repeat the division. `cpu_percent` is a nominal single-core %
+ * (Docker's `docker stats` calculation) so we can spot a runaway loop.
+ */
+interface StatsSample {
+  ts: string;
+  usage_bytes: number;
+  limit_bytes: number | null;
+  usage_ratio: number | null;
+  cpu_percent: number | null;
+}
+
+interface DockerStatsResponse {
+  read?: string;
+  memory_stats?: {
+    usage?: number;
+    limit?: number;
+  };
+  cpu_stats?: {
+    cpu_usage?: { total_usage?: number };
+    system_cpu_usage?: number;
+    online_cpus?: number;
+  };
+  precpu_stats?: {
+    cpu_usage?: { total_usage?: number };
+    system_cpu_usage?: number;
+  };
+}
+
+const statsHistory: Record<string, StatsSample[]> = {};
+const pressureCount: Record<string, number> = {};
+
+/**
+ * Compute the `docker stats`-style CPU percentage. Returns null when we
+ * don't have both a current and prior CPU sample (first poll after startup)
+ * or when totals are unset — treating those as null is what `docker stats`
+ * itself does on the first frame.
+ */
+function calcCpuPercent(s: DockerStatsResponse): number | null {
+  const cpu = s.cpu_stats?.cpu_usage?.total_usage;
+  const system = s.cpu_stats?.system_cpu_usage;
+  const preCpu = s.precpu_stats?.cpu_usage?.total_usage;
+  const preSystem = s.precpu_stats?.system_cpu_usage;
+  const onlineCpus = s.cpu_stats?.online_cpus ?? 1;
+  if (
+    cpu === undefined ||
+    system === undefined ||
+    preCpu === undefined ||
+    preSystem === undefined
+  )
+    return null;
+  const cpuDelta = cpu - preCpu;
+  const systemDelta = system - preSystem;
+  if (systemDelta <= 0 || cpuDelta < 0) return null;
+  return Math.round((cpuDelta / systemDelta) * onlineCpus * 100 * 10) / 10;
+}
+
+async function pollStats(): Promise<void> {
+  for (const name of MONITOR_TARGETS) {
+    try {
+      const { status, body } = await dockerRequest<DockerStatsResponse>(
+        "GET",
+        `/containers/${name}/stats?stream=false`
+      );
+      if (status !== 200) continue;
+
+      const usage = body.memory_stats?.usage ?? 0;
+      const limit = body.memory_stats?.limit ?? null;
+      // Docker reports the host's total RAM as the "limit" when the container
+      // has no explicit --memory constraint. That makes the ratio effectively
+      // useless (nothing will ever push it to 85% of host RAM). Treat any
+      // limit > 90% of host RAM as "unlimited" — the container has no cap.
+      const usageRatio = limit && limit > 0 ? usage / limit : null;
+      const cpuPercent = calcCpuPercent(body);
+
+      const sample: StatsSample = {
+        ts: body.read ?? new Date().toISOString(),
+        usage_bytes: usage,
+        limit_bytes: limit,
+        usage_ratio: usageRatio,
+        cpu_percent: cpuPercent,
+      };
+
+      const ring = statsHistory[name] ?? [];
+      ring.push(sample);
+      if (ring.length > STATS_HISTORY_SIZE) ring.shift();
+      statsHistory[name] = ring;
+
+      // Sustained memory-pressure alarm: N consecutive samples above the
+      // ratio threshold. Only fires when the container has an explicit
+      // memory limit (usage_ratio non-null).
+      if (usageRatio !== null && usageRatio >= MEMORY_PRESSURE_RATIO) {
+        pressureCount[name] = (pressureCount[name] ?? 0) + 1;
+        if (pressureCount[name] === MEMORY_PRESSURE_SUSTAINED) {
+          const pct = Math.round(usageRatio * 100);
+          const usageMB = Math.round(usage / 1024 / 1024);
+          const limitMB = limit ? Math.round(limit / 1024 / 1024) : "?";
+          await sendAlarm(
+            "MEMORY_PRESSURE",
+            name,
+            `Memory at ${pct}% of container limit (${usageMB} MB / ${limitMB} MB) sustained across ${MEMORY_PRESSURE_SUSTAINED} polls — OOM likely if trend continues.`
+          );
+        }
+      } else if (usageRatio !== null) {
+        pressureCount[name] = 0;
+      }
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : String(e);
+      console.error(`[stats] poll failed for ${name}:`, msg);
     }
   }
 }
@@ -465,6 +597,26 @@ async function handleRequest(
     return;
   }
 
+  // GET /stats/:container — restricted to MONITOR_TARGETS
+  const statsMatch = /^\/stats\/([^/]+)$/.exec(pathname);
+  if (statsMatch && req.method === "GET") {
+    const container = statsMatch[1] ?? "";
+    if (!MONITOR_TARGETS.includes(container)) {
+      sendJson(res, 403, { error: "Container not in MONITOR_TARGETS" });
+      return;
+    }
+    const ring = statsHistory[container] ?? [];
+    const latest = ring.length > 0 ? ring[ring.length - 1] : null;
+    sendJson(res, 200, {
+      container,
+      poll_interval_ms: STATS_POLL_INTERVAL_MS,
+      pressure_threshold_ratio: MEMORY_PRESSURE_RATIO,
+      latest,
+      history: ring,
+    });
+    return;
+  }
+
   // GET /logs/:container — restricted to MONITOR_TARGETS
   const logsMatch = /^\/logs\/([^/]+)$/.exec(pathname);
   if (logsMatch && req.method === "GET") {
@@ -505,10 +657,13 @@ server.listen(LOG_PORT, () => {
   console.log(`[monitor] Log server listening on port ${LOG_PORT}`);
   console.log(`[monitor] Targets: ${MONITOR_TARGETS.join(", ") || "(none)"}`);
   console.log(`[monitor] Health poll interval: ${HEALTH_POLL_INTERVAL_MS}ms`);
+  console.log(`[monitor] Stats poll interval: ${STATS_POLL_INTERVAL_MS}ms · history=${STATS_HISTORY_SIZE} · pressure=${MEMORY_PRESSURE_RATIO}×${MEMORY_PRESSURE_SUSTAINED}`);
   if (!DISCORD_WEBHOOK) console.warn("[monitor] DISCORD_ALARM_WEBHOOK not set — alarms disabled");
   if (!LOG_SERVER_TOKEN) console.warn("[monitor] LOG_SERVER_TOKEN not set — log API is open");
 });
 
 setInterval(() => void pollHealth(), HEALTH_POLL_INTERVAL_MS);
 void pollHealth(); // immediate first check
+setInterval(() => void pollStats(), STATS_POLL_INTERVAL_MS);
+void pollStats(); // immediate first sample
 void watchEvents();
