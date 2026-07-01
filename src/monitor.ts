@@ -5,16 +5,19 @@
  *   1. Discord alarm trigger — webhook on any error/crash/health failure
  *   2. Healthcheck polling — Docker socket, GET /containers/{name}/json every 60s
  *   3. Docker event capture — die/oom events via Docker socket event stream (kill events ignored)
- *   4. Log server — read-only HTTP API backed by Docker socket
- *   5. Pre-deploy log persistence — dumps container logs to disk before graceful shutdown (CD deploy)
+ *   4. Log server — read-only HTTP API backed by systemd-journald
  *
- * All five run in one process, managed by pm2 on the host.
+ * All four run in one process, managed by pm2 on the host.
+ *
+ * Log-source note: monitored containers are expected to log via the
+ * `journald` docker log driver so their history persists across
+ * container recreate. journalctl reads by `CONTAINER_NAME=<name>`.
+ * See hoiekim/inbox PR #641 for the compose-side setup.
  */
 
-import fs from "fs";
-import path from "path";
 import http from "http";
 import https from "https";
+import { spawn } from "child_process";
 
 // ---------------------------------------------------------------------------
 // Config
@@ -37,8 +40,7 @@ const HEALTH_POLL_INTERVAL_MS = parseInt(
 const ALARM_COOLDOWN_MS = parseInt(process.env.ALARM_COOLDOWN_MS ?? "60000", 10);
 const LOG_PORT = parseInt(process.env.LOG_PORT ?? "9000", 10);
 const DOCKER_SOCKET = process.env.DOCKER_SOCKET ?? "/var/run/docker.sock";
-const PRE_DEPLOY_LOG_DIR = process.env.PRE_DEPLOY_LOG_DIR ?? "/var/log/monitor-predeploy";
-const PRE_DEPLOY_LOG_TAIL = parseInt(process.env.PRE_DEPLOY_LOG_TAIL ?? "500", 10);
+const JOURNALCTL_BIN = process.env.JOURNALCTL_BIN ?? "journalctl";
 
 // ---------------------------------------------------------------------------
 // Docker socket helpers
@@ -225,56 +227,58 @@ async function pollHealth(): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------
-// Pre-deploy log persistence (#5)
+// Journald log reader
 // ---------------------------------------------------------------------------
 
 /**
- * Dump the last N log lines for a container to disk before it is removed.
- * Called synchronously from the "die" handler when we detect a graceful stop
- * (exit codes 137/143 = deployment replacement). The container process has exited
- * but the container object still exists briefly — Docker logs remain readable.
+ * Read the last `tail` log lines a container has written to systemd-journald.
+ * The `journald` docker log driver labels each log entry with
+ * `CONTAINER_NAME=<name>`; we filter by that and use `--output=cat` to
+ * return just the message bodies (no timestamp/host prefix — the caller
+ * decides how to render). Streams stdout back through `onChunk` so a
+ * `follow=1` mode can be added later without refactor.
  *
- * Files are written to PRE_DEPLOY_LOG_DIR as:
- *   <container>-<ISO-timestamp>.log
+ * Returns a disposer that kills the child when the caller is done
+ * (usually the HTTP client disconnecting mid-tail).
  */
-async function savePreDeployLogs(container: string): Promise<void> {
-  try {
-    fs.mkdirSync(PRE_DEPLOY_LOG_DIR, { recursive: true });
-  } catch (e: unknown) {
-    console.error(
-      `[predeploy] mkdir ${PRE_DEPLOY_LOG_DIR} failed:`,
-      e instanceof Error ? e.message : String(e)
-    );
-    return;
-  }
+function readContainerLogsFromJournal(params: {
+  container: string;
+  tail: number;
+  onChunk: (buf: Buffer) => void;
+  onEnd: () => void;
+  onError: (err: Error) => void;
+}): () => void {
+  const { container, tail, onChunk, onEnd, onError } = params;
+  const args = [
+    `CONTAINER_NAME=${container}`,
+    "-n",
+    String(tail),
+    "--output=cat",
+    "--no-pager",
+  ];
+  const child = spawn(JOURNALCTL_BIN, args, { stdio: ["ignore", "pipe", "pipe"] });
+  let stderr = "";
 
-  const ts = new Date().toISOString().replace(/[:.]/g, "-");
-  const filename = `${container}-${ts}.log`;
-  const filepath = path.join(PRE_DEPLOY_LOG_DIR, filename);
-  const logPath = `/containers/${container}/logs?stdout=1&stderr=1&tail=${PRE_DEPLOY_LOG_TAIL}&timestamps=1`;
+  child.stdout?.on("data", onChunk);
+  child.stderr?.on("data", (chunk: Buffer) => {
+    stderr += chunk.toString();
+  });
+  child.on("error", onError);
+  child.on("close", (code) => {
+    if (code === 0) {
+      onEnd();
+    } else {
+      onError(new Error(`journalctl exited ${code}${stderr ? ": " + stderr.trim() : ""}`));
+    }
+  });
 
-  try {
-    const stream = await dockerStream(logPath);
-    const chunks: Buffer[] = [];
-
-    await new Promise<void>((resolve, reject) => {
-      stream.on("data", (chunk: Buffer) => chunks.push(chunk));
-      stream.on("end", resolve);
-      stream.on("error", reject);
-    });
-
-    const raw = Buffer.concat(chunks);
-    const text = stripDockerFraming(raw).toString("utf8");
-    fs.writeFileSync(filepath, text, "utf8");
-    console.log(
-      `[predeploy] saved ${PRE_DEPLOY_LOG_TAIL} lines for ${container} → ${filepath}`
-    );
-  } catch (e: unknown) {
-    console.error(
-      `[predeploy] failed to save logs for ${container}:`,
-      e instanceof Error ? e.message : String(e)
-    );
-  }
+  return () => {
+    try {
+      child.kill();
+    } catch {
+      /* already gone */
+    }
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -330,12 +334,10 @@ async function watchEvents(): Promise<void> {
             const isGraceful = !isNaN(exitCode) && GRACEFUL_EXIT_CODES.has(exitCode);
             const exitDisplay = isNaN(exitCode) ? "?" : String(exitCode);
 
-            // Save logs on every die (graceful or crash) — covers both planned deploys
-            // and unexpected crashes. OOM kills also emit a subsequent "die" event, so
-            // log saving is handled here and skipped in the "oom" handler.
-            savePreDeployLogs(name).catch((e: unknown) => {
-              console.error("[events] savePreDeployLogs failed:", e instanceof Error ? e.message : String(e));
-            });
+            // Container logs live in systemd-journald (see file header) and
+            // survive container recreate independently — no pre-deploy dump
+            // needed. `journalctl CONTAINER_NAME=<name> --since <die-ts>`
+            // recovers the tail post-hoc when triage requires it.
 
             if (isGraceful) {
               console.log(`[events] ${name}: die (exit=${exitCode}) — graceful stop, no alarm`);
@@ -472,30 +474,23 @@ async function handleRequest(
       return;
     }
     const tail = parseInt(url.searchParams.get("tail") ?? "100", 10);
-    const path = `/containers/${container}/logs?stdout=1&stderr=1&tail=${tail}&timestamps=1`;
 
     res.writeHead(200, { "Content-Type": "text/plain; charset=utf-8" });
 
-    try {
-      const stream = await dockerStream(path);
-
-      // Close the Docker socket when the HTTP client disconnects.
-      // Without this, the Docker stream stays open and accumulates FDs.
-      req.on("close", () => stream.destroy());
-
-      stream.on("data", (chunk: Buffer) => {
-        res.write(stripDockerFraming(chunk));
-      });
-      stream.on("end", () => res.end());
-      stream.on("error", (e: Error) => {
+    const disposer = readContainerLogsFromJournal({
+      container,
+      tail,
+      onChunk: (chunk) => {
+        res.write(chunk);
+      },
+      onEnd: () => res.end(),
+      onError: (e) => {
         res.write(`\n[error reading logs: ${e.message}]\n`);
         res.end();
-      });
-    } catch (e: unknown) {
-      const msg = e instanceof Error ? e.message : String(e);
-      res.write(`[error: ${msg}]\n`);
-      res.end();
-    }
+      },
+    });
+    // Kill journalctl if the HTTP client disconnects mid-read.
+    req.on("close", disposer);
     return;
   }
 

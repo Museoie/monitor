@@ -1,12 +1,11 @@
 # monitor
 
-Single-file prod monitor managed by pm2. Five responsibilities in one process:
+Single-file prod monitor managed by pm2. Four responsibilities in one process:
 
 1. **Discord alarm** — webhook on crash, health failure, or recovery
 2. **Healthcheck polling** — Docker socket `/containers/{name}/json` every 60s
 3. **Docker event capture** — `die`/`kill`/`oom` events via Docker event stream
-4. **Log server** — read-only HTTP API backed by Docker socket
-5. **Pre-deploy log persistence** — dumps container logs to disk on graceful shutdown (CD deploys)
+4. **Log server** — read-only HTTP API backed by `journalctl` (systemd-journald)
 
 ## Setup
 
@@ -19,6 +18,31 @@ pm2 save
 ```
 
 No install step needed — `monitor.js` is plain Node.js with no dependencies.
+
+## Log source: systemd-journald
+
+Container logs are read from the host's systemd journal. Monitored containers must ship stdout to journald via the `journald` docker log driver:
+
+```yaml
+services:
+  hoie-inbox:
+    logging:
+      driver: journald
+      options:
+        tag: "hoie-inbox"
+```
+
+The log server queries `journalctl CONTAINER_NAME=<name> -n <tail> --output=cat --no-pager`. Retention is host-side, configured in `/etc/systemd/journald.conf`:
+
+```
+Storage=persistent
+SystemMaxUse=2G
+MaxRetentionSec=30day
+```
+
+`systemctl restart systemd-journald` to apply. If `/var/log/journal/` doesn't exist the journal is in-memory only — `mkdir -p /var/log/journal && systemctl restart systemd-journald`.
+
+The user running monitor (via pm2) needs read access to the journal — either run as `root` or add the user to the `systemd-journal` group: `sudo usermod -aG systemd-journal <user>` then relogin.
 
 ## Log Server API
 
@@ -42,9 +66,8 @@ Auth: `Authorization: Bearer $LOG_SERVER_TOKEN`
 | `HEALTH_POLL_INTERVAL_MS` | no | `60000` | Health poll interval |
 | `HEALTH_FAIL_THRESHOLD` | no | `1` | Failures before alarm |
 | `ALARM_COOLDOWN_MS` | no | `60000` | Cooldown between same alarms |
-| `DOCKER_SOCKET` | no | `/var/run/docker.sock` | Docker socket path |
-| `PRE_DEPLOY_LOG_DIR` | no | `/var/log/monitor-predeploy` | Directory for pre-deploy log dumps |
-| `PRE_DEPLOY_LOG_TAIL` | no | `500` | Lines to save per container on graceful stop |
+| `DOCKER_SOCKET` | no | `/var/run/docker.sock` | Docker socket path (healthcheck + event stream) |
+| `JOURNALCTL_BIN` | no | `journalctl` | Path to `journalctl`; override if not on `$PATH` |
 
 ## Design Doc
 
