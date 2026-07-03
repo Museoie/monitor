@@ -6,7 +6,7 @@ Single-file prod monitor managed by pm2. Five responsibilities in one process:
 2. **Healthcheck polling** — Docker socket `/containers/{name}/json` every 60s
 3. **Docker event capture** — `die`/`kill`/`oom` events via Docker event stream
 4. **Log server** — read-only HTTP API backed by `journalctl` (systemd-journald)
-5. **Docker stats polling** — memory + CPU sampled from Docker socket every 60s; `MEMORY_PRESSURE` early-warning alarm before OOM
+5. **Docker stats polling** — memory + CPU sampled from Docker socket every 20s; `MEMORY_PRESSURE` early-warning alarm before OOM
 
 ## Setup
 
@@ -72,7 +72,8 @@ Stats are polled from the Docker socket (`/containers/{name}/stats?stream=false`
 | `ALARM_COOLDOWN_MS` | no | `60000` | Cooldown between same alarms |
 | `DOCKER_SOCKET` | no | `/var/run/docker.sock` | Docker socket path (healthcheck + event stream + stats poll) |
 | `JOURNALCTL_BIN` | no | `journalctl` | Path to `journalctl`; override if not on `$PATH` |
-| `STATS_POLL_INTERVAL_MS` | no | `60000` | Docker stats poll interval per container |
+| `STATS_POLL_INTERVAL_MS` | no | `20000` | Docker stats poll interval per container |
+| `JOURNALCTL_TIMEOUT_MS` | no | `15000` | Hard-kill `journalctl` if it hangs |
 | `STATS_HISTORY_SIZE` | no | `60` | Samples kept in the ring buffer (default = 1 hour at 60s interval) |
 | `MEMORY_PRESSURE_RATIO` | no | `0.85` | Alarm when `usage / limit` ≥ this ratio |
 | `MEMORY_PRESSURE_SUSTAINED` | no | `3` | Consecutive polls required before alarming |
