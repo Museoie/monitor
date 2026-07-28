@@ -5,16 +5,20 @@
  *   1. Discord alarm trigger — webhook on any error/crash/health failure
  *   2. Healthcheck polling — Docker socket, GET /containers/{name}/json every 60s
  *   3. Docker event capture — die/oom events via Docker socket event stream (kill events ignored)
- *   4. Log server — read-only HTTP API backed by Docker socket
- *   5. Pre-deploy log persistence — dumps container logs to disk before graceful shutdown (CD deploy)
+ *   4. Log server — read-only HTTP API backed by systemd-journald
  *
- * All five run in one process, managed by pm2 on the host.
+ * All four run in one process, managed by pm2 on the host.
+ *
+ * Log-source note: monitored containers are expected to log via the
+ * `journald` docker log driver so their history persists across
+ * container recreate. journalctl reads by `CONTAINER_NAME=<name>`.
+ * See hoiekim/inbox PR #641 for the compose-side setup.
  */
 
-import fs from "fs";
-import path from "path";
 import http from "http";
 import https from "https";
+import { spawn } from "child_process";
+import { readFileSync } from "fs";
 
 // ---------------------------------------------------------------------------
 // Config
@@ -37,8 +41,63 @@ const HEALTH_POLL_INTERVAL_MS = parseInt(
 const ALARM_COOLDOWN_MS = parseInt(process.env.ALARM_COOLDOWN_MS ?? "60000", 10);
 const LOG_PORT = parseInt(process.env.LOG_PORT ?? "9000", 10);
 const DOCKER_SOCKET = process.env.DOCKER_SOCKET ?? "/var/run/docker.sock";
-const PRE_DEPLOY_LOG_DIR = process.env.PRE_DEPLOY_LOG_DIR ?? "/var/log/monitor-predeploy";
-const PRE_DEPLOY_LOG_TAIL = parseInt(process.env.PRE_DEPLOY_LOG_TAIL ?? "500", 10);
+const JOURNALCTL_BIN = process.env.JOURNALCTL_BIN ?? "journalctl";
+// Tightened default to 20s (was 60s). Typical OOM lead time from
+// 85%→kill is 10-60s under sustained load; a 3× minute poll cadence
+// often missed the pre-death signal the alarm exists to catch.
+const STATS_POLL_INTERVAL_MS = parseIntEnv("STATS_POLL_INTERVAL_MS", 20_000);
+const STATS_HISTORY_SIZE = parseIntEnv("STATS_HISTORY_SIZE", 60);
+const MEMORY_PRESSURE_RATIO = parseFloatEnv("MEMORY_PRESSURE_RATIO", 0.85);
+const MEMORY_PRESSURE_SUSTAINED = parseIntEnv("MEMORY_PRESSURE_SUSTAINED", 3);
+const JOURNALCTL_TIMEOUT_MS = parseIntEnv("JOURNALCTL_TIMEOUT_MS", 15_000);
+
+// Host RAM ceiling. Docker reports `memory_stats.limit` as host total
+// when a container has no `--memory` cap; treating that as a real
+// limit yields misleading `usage_ratio` values (a 4 GB app on 128 GB
+// host reads as 0.03 "healthy"). Read /proc/meminfo once at startup.
+const HOST_MEM_TOTAL_BYTES = readHostMemTotalBytes();
+
+function parseIntEnv(name: string, fallback: number): number {
+  const raw = process.env[name];
+  if (raw === undefined || raw === "") return fallback;
+  const parsed = parseInt(raw, 10);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    console.warn(`[config] ${name}=${JSON.stringify(raw)} is not a positive int — using default ${fallback}`);
+    return fallback;
+  }
+  return parsed;
+}
+
+function parseFloatEnv(name: string, fallback: number): number {
+  const raw = process.env[name];
+  if (raw === undefined || raw === "") return fallback;
+  const parsed = parseFloat(raw);
+  if (!Number.isFinite(parsed)) {
+    console.warn(`[config] ${name}=${JSON.stringify(raw)} is not a valid float — using default ${fallback}`);
+    return fallback;
+  }
+  return parsed;
+}
+
+function readHostMemTotalBytes(): number {
+  try {
+    const meminfo = readFileSync("/proc/meminfo", "utf-8");
+    const match = /MemTotal:\s+(\d+)\s+kB/.exec(meminfo);
+    if (match) return parseInt(match[1], 10) * 1024;
+  } catch {
+    /* not Linux, or /proc unreadable — fall back to a very large value
+       so the "cap unset" guard below never accidentally treats a real
+       limit as unlimited. */
+  }
+  return Number.MAX_SAFE_INTEGER;
+}
+
+// A `memory_stats.limit` at or above 90% of host RAM is almost
+// certainly Docker reporting "no cap" — a legitimate container-level
+// cap is orders of magnitude lower on our hosts. Used by both
+// `pollStats` and `/stats` to skip the misleading ratio.
+const IS_UNLIMITED = (limit: number | null | undefined): boolean =>
+  limit == null || limit <= 0 || limit >= HOST_MEM_TOTAL_BYTES * 0.9;
 
 // ---------------------------------------------------------------------------
 // Docker socket helpers
@@ -89,24 +148,6 @@ function dockerStream(path: string): Promise<http.IncomingMessage> {
 // ---------------------------------------------------------------------------
 // Docker log framing (shared utility)
 // ---------------------------------------------------------------------------
-
-/**
- * Docker log stream uses a multiplexed framing format:
- *   [stream_type(1)] [0(3)] [size(4 BE)] [payload(size)]
- * Strip headers so callers receive plain text.
- */
-function stripDockerFraming(buf: Buffer): Buffer {
-  const parts: Buffer[] = [];
-  let offset = 0;
-  while (offset + 8 <= buf.length) {
-    const size = buf.readUInt32BE(offset + 4);
-    if (size === 0) { offset += 8; continue; }
-    if (offset + 8 + size > buf.length) break;
-    parts.push(buf.subarray(offset + 8, offset + 8 + size));
-    offset += 8 + size;
-  }
-  return parts.length > 0 ? Buffer.concat(parts) : buf;
-}
 
 // ---------------------------------------------------------------------------
 // Discord alarm
@@ -225,56 +266,212 @@ async function pollHealth(): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------
-// Pre-deploy log persistence (#5)
+// Container memory / CPU stats polling
 // ---------------------------------------------------------------------------
 
 /**
- * Dump the last N log lines for a container to disk before it is removed.
- * Called synchronously from the "die" handler when we detect a graceful stop
- * (exit codes 137/143 = deployment replacement). The container process has exited
- * but the container object still exists briefly — Docker logs remain readable.
- *
- * Files are written to PRE_DEPLOY_LOG_DIR as:
- *   <container>-<ISO-timestamp>.log
+ * Snapshot of one docker stats sample, distilled to the fields we actually
+ * use for triage. `usage_bytes` and `limit_bytes` come from `memory_stats`
+ * exactly as Docker reports them; `usage_ratio` is precomputed so callers
+ * don't repeat the division. `cpu_percent` is a nominal single-core %
+ * (Docker's `docker stats` calculation) so we can spot a runaway loop.
  */
-async function savePreDeployLogs(container: string): Promise<void> {
-  try {
-    fs.mkdirSync(PRE_DEPLOY_LOG_DIR, { recursive: true });
-  } catch (e: unknown) {
-    console.error(
-      `[predeploy] mkdir ${PRE_DEPLOY_LOG_DIR} failed:`,
-      e instanceof Error ? e.message : String(e)
-    );
-    return;
+interface StatsSample {
+  ts: string;
+  usage_bytes: number;
+  limit_bytes: number | null;
+  usage_ratio: number | null;
+  cpu_percent: number | null;
+}
+
+interface DockerStatsResponse {
+  read?: string;
+  memory_stats?: {
+    usage?: number;
+    limit?: number;
+  };
+  cpu_stats?: {
+    cpu_usage?: { total_usage?: number };
+    system_cpu_usage?: number;
+    online_cpus?: number;
+  };
+  precpu_stats?: {
+    cpu_usage?: { total_usage?: number };
+    system_cpu_usage?: number;
+  };
+}
+
+const statsHistory: Record<string, StatsSample[]> = {};
+const pressureCount: Record<string, number> = {};
+
+/**
+ * Compute the `docker stats`-style CPU percentage. Returns null when we
+ * don't have both a current and prior CPU sample (first poll after startup)
+ * or when totals are unset — treating those as null is what `docker stats`
+ * itself does on the first frame.
+ */
+function calcCpuPercent(s: DockerStatsResponse): number | null {
+  const cpu = s.cpu_stats?.cpu_usage?.total_usage;
+  const system = s.cpu_stats?.system_cpu_usage;
+  const preCpu = s.precpu_stats?.cpu_usage?.total_usage;
+  const preSystem = s.precpu_stats?.system_cpu_usage;
+  const onlineCpus = s.cpu_stats?.online_cpus ?? 1;
+  if (
+    cpu === undefined ||
+    system === undefined ||
+    preCpu === undefined ||
+    preSystem === undefined
+  )
+    return null;
+  const cpuDelta = cpu - preCpu;
+  const systemDelta = system - preSystem;
+  if (systemDelta <= 0 || cpuDelta < 0) return null;
+  return Math.round((cpuDelta / systemDelta) * onlineCpus * 100 * 10) / 10;
+}
+
+async function pollStats(): Promise<void> {
+  for (const name of MONITOR_TARGETS) {
+    try {
+      const { status, body } = await dockerRequest<DockerStatsResponse>(
+        "GET",
+        `/containers/${name}/stats?stream=false`
+      );
+      if (status !== 200) continue;
+
+      const usage = body.memory_stats?.usage ?? 0;
+      const limit = body.memory_stats?.limit ?? null;
+      // Docker reports the host's total RAM as "limit" when the
+      // container has no explicit `--memory` cap. Ratios computed
+      // against host RAM are misleading — the numbers look fine
+      // (0.03) even for a container about to OOM against a real cap.
+      // Use `IS_UNLIMITED` (defined at top with the host-mem read) so
+      // `/stats` reports `null` and the alarm block skips this
+      // container consistently.
+      const usageRatio = IS_UNLIMITED(limit) ? null : usage / (limit as number);
+      const cpuPercent = calcCpuPercent(body);
+
+      const sample: StatsSample = {
+        ts: body.read ?? new Date().toISOString(),
+        usage_bytes: usage,
+        limit_bytes: limit,
+        usage_ratio: usageRatio,
+        cpu_percent: cpuPercent,
+      };
+
+      const ring = statsHistory[name] ?? [];
+      ring.push(sample);
+      if (ring.length > STATS_HISTORY_SIZE) ring.shift();
+      statsHistory[name] = ring;
+
+      // Sustained memory-pressure alarm: N consecutive samples above
+      // the ratio threshold. Only fires when the container has an
+      // explicit memory limit (usage_ratio non-null). Uses `>=` (not
+      // `===`) so continued pressure re-attempts the alarm on every
+      // subsequent poll — `ALARM_COOLDOWN_MS` gates the actual
+      // Discord spam. With `===` a single ping fired at poll N and
+      // then stayed silent for the entire pressure episode.
+      if (usageRatio !== null && usageRatio >= MEMORY_PRESSURE_RATIO) {
+        pressureCount[name] = (pressureCount[name] ?? 0) + 1;
+        if (pressureCount[name] >= MEMORY_PRESSURE_SUSTAINED) {
+          const pct = Math.round(usageRatio * 100);
+          const usageMB = Math.round(usage / 1024 / 1024);
+          const limitMB = limit ? Math.round(limit / 1024 / 1024) : "?";
+          await sendAlarm(
+            "MEMORY_PRESSURE",
+            name,
+            `Memory at ${pct}% of container limit (${usageMB} MB / ${limitMB} MB) sustained across ${MEMORY_PRESSURE_SUSTAINED}+ polls — OOM likely if trend continues.`
+          );
+        }
+      } else if (usageRatio !== null) {
+        pressureCount[name] = 0;
+      }
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : String(e);
+      console.error(`[stats] poll failed for ${name}:`, msg);
+    }
   }
+}
 
-  const ts = new Date().toISOString().replace(/[:.]/g, "-");
-  const filename = `${container}-${ts}.log`;
-  const filepath = path.join(PRE_DEPLOY_LOG_DIR, filename);
-  const logPath = `/containers/${container}/logs?stdout=1&stderr=1&tail=${PRE_DEPLOY_LOG_TAIL}&timestamps=1`;
+// ---------------------------------------------------------------------------
+// Journald log reader
+// ---------------------------------------------------------------------------
 
-  try {
-    const stream = await dockerStream(logPath);
-    const chunks: Buffer[] = [];
+/**
+ * Read the last `tail` log lines a container has written to systemd-journald.
+ * The `journald` docker log driver labels each log entry with
+ * `CONTAINER_NAME=<name>`; we filter by that and use `--output=cat` to
+ * return just the message bodies (no timestamp/host prefix — the caller
+ * decides how to render). Streams stdout back through `onChunk` so a
+ * `follow=1` mode can be added later without refactor.
+ *
+ * Returns a disposer that kills the child when the caller is done
+ * (usually the HTTP client disconnecting mid-tail).
+ */
+const STDERR_BUFFER_MAX = 64 * 1024;
 
-    await new Promise<void>((resolve, reject) => {
-      stream.on("data", (chunk: Buffer) => chunks.push(chunk));
-      stream.on("end", resolve);
-      stream.on("error", reject);
+function readContainerLogsFromJournal(params: {
+  container: string;
+  tail: number;
+  onChunk: (buf: Buffer) => void;
+  onEnd: () => void;
+  onError: (err: Error) => void;
+}): () => void {
+  const { container, tail, onChunk, onEnd, onError } = params;
+  const args = [
+    `CONTAINER_NAME=${container}`,
+    "-n",
+    String(tail),
+    "--output=cat",
+    "--no-pager",
+  ];
+  const child = spawn(JOURNALCTL_BIN, args, { stdio: ["ignore", "pipe", "pipe"] });
+  let stderr = "";
+  // `error` (ENOENT / spawn failure) and `close` (with nonzero code)
+  // both fire on failed spawn — without a settled guard, `onError`
+  // runs twice and the caller writes to a response that's already
+  // ended (ERR_STREAM_WRITE_AFTER_END). Also protects against the
+  // disposer-then-close race when the HTTP client disconnects.
+  let settled = false;
+  const settle = (fn: () => void) => {
+    if (settled) return;
+    settled = true;
+    fn();
+  };
+
+  // Bound `stderr` growth. journalctl normally exits on first fatal
+  // error, but a corrupt journal under stress could stream KB/s of
+  // errors indefinitely.
+  child.stdout?.on("data", onChunk);
+  child.stderr?.on("data", (chunk: Buffer) => {
+    if (stderr.length < STDERR_BUFFER_MAX) stderr += chunk.toString();
+  });
+  child.on("error", (e) => settle(() => onError(e)));
+  child.on("close", (code) => {
+    settle(() => {
+      if (code === 0) onEnd();
+      else onError(new Error(`journalctl exited ${code}${stderr ? ": " + stderr.trim() : ""}`));
     });
+  });
 
-    const raw = Buffer.concat(chunks);
-    const text = stripDockerFraming(raw).toString("utf8");
-    fs.writeFileSync(filepath, text, "utf8");
-    console.log(
-      `[predeploy] saved ${PRE_DEPLOY_LOG_TAIL} lines for ${container} → ${filepath}`
-    );
-  } catch (e: unknown) {
-    console.error(
-      `[predeploy] failed to save logs for ${container}:`,
-      e instanceof Error ? e.message : String(e)
-    );
-  }
+  // Hard timeout — a hung journalctl (rare, but possible on
+  // systemd-journald under load) shouldn't leak the child if the HTTP
+  // client isn't enforcing its own deadline.
+  const timeoutHandle = setTimeout(() => {
+    settle(() => {
+      try { child.kill("SIGKILL"); } catch { /* already gone */ }
+      onError(new Error(`journalctl timeout after ${JOURNALCTL_TIMEOUT_MS}ms`));
+    });
+  }, JOURNALCTL_TIMEOUT_MS);
+  child.on("close", () => clearTimeout(timeoutHandle));
+
+  return () => {
+    // Mark settled BEFORE killing so the ensuing `close` event's
+    // handler no-ops (otherwise it would `onError` on an
+    // already-ended socket).
+    settled = true;
+    clearTimeout(timeoutHandle);
+    try { child.kill(); } catch { /* already gone */ }
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -330,12 +527,10 @@ async function watchEvents(): Promise<void> {
             const isGraceful = !isNaN(exitCode) && GRACEFUL_EXIT_CODES.has(exitCode);
             const exitDisplay = isNaN(exitCode) ? "?" : String(exitCode);
 
-            // Save logs on every die (graceful or crash) — covers both planned deploys
-            // and unexpected crashes. OOM kills also emit a subsequent "die" event, so
-            // log saving is handled here and skipped in the "oom" handler.
-            savePreDeployLogs(name).catch((e: unknown) => {
-              console.error("[events] savePreDeployLogs failed:", e instanceof Error ? e.message : String(e));
-            });
+            // Container logs live in systemd-journald (see file header) and
+            // survive container recreate independently — no pre-deploy dump
+            // needed. `journalctl CONTAINER_NAME=<name> --since <die-ts>`
+            // recovers the tail post-hoc when triage requires it.
 
             if (isGraceful) {
               console.log(`[events] ${name}: die (exit=${exitCode}) — graceful stop, no alarm`);
@@ -426,11 +621,11 @@ async function handleRequest(
   }
   const pathname = url.pathname;
 
-  if (!isAuthenticated(req)) {
-    sendJson(res, 401, { error: "Unauthorized" });
-    return;
-  }
-
+  // `/health` is intentionally unauthenticated — its body is
+  // low-sensitivity (process uptime + monitored container names +
+  // last-known health/restart states) and orchestrator health probes
+  // need a public endpoint. README documents this row as "no auth"; a
+  // Bearer gate here would silent-401 the probes.
   if (pathname === "/health") {
     sendJson(res, 200, {
       status: "ok",
@@ -438,6 +633,11 @@ async function handleRequest(
       health: healthState,
       uptime: process.uptime(),
     });
+    return;
+  }
+
+  if (!isAuthenticated(req)) {
+    sendJson(res, 401, { error: "Unauthorized" });
     return;
   }
 
@@ -463,6 +663,26 @@ async function handleRequest(
     return;
   }
 
+  // GET /stats/:container — restricted to MONITOR_TARGETS
+  const statsMatch = /^\/stats\/([^/]+)$/.exec(pathname);
+  if (statsMatch && req.method === "GET") {
+    const container = statsMatch[1] ?? "";
+    if (!MONITOR_TARGETS.includes(container)) {
+      sendJson(res, 403, { error: "Container not in MONITOR_TARGETS" });
+      return;
+    }
+    const ring = statsHistory[container] ?? [];
+    const latest = ring.length > 0 ? ring[ring.length - 1] : null;
+    sendJson(res, 200, {
+      container,
+      poll_interval_ms: STATS_POLL_INTERVAL_MS,
+      pressure_threshold_ratio: MEMORY_PRESSURE_RATIO,
+      latest,
+      history: ring,
+    });
+    return;
+  }
+
   // GET /logs/:container — restricted to MONITOR_TARGETS
   const logsMatch = /^\/logs\/([^/]+)$/.exec(pathname);
   if (logsMatch && req.method === "GET") {
@@ -471,31 +691,45 @@ async function handleRequest(
       sendJson(res, 403, { error: "Container not in MONITOR_TARGETS" });
       return;
     }
-    const tail = parseInt(url.searchParams.get("tail") ?? "100", 10);
-    const path = `/containers/${container}/logs?stdout=1&stderr=1&tail=${tail}&timestamps=1`;
+    // Validate `tail`: unbounded / non-numeric / negative values used to
+    // reach journalctl and either error out or return an unbounded
+    // history. Clamp to [1, 10000] and default to 100.
+    const tailRaw = parseInt(url.searchParams.get("tail") ?? "100", 10);
+    const tail = Number.isFinite(tailRaw) && tailRaw > 0 && tailRaw <= 10_000 ? tailRaw : 100;
 
-    res.writeHead(200, { "Content-Type": "text/plain; charset=utf-8" });
+    // Delay `writeHead` until first stdout chunk arrives. journalctl
+    // spawn failures (missing binary, permission denied) previously
+    // returned 200 with an error message in the body, so any consumer
+    // gating on status treated it as success.
+    let headersSent = false;
+    const startStreaming = () => {
+      if (headersSent) return;
+      headersSent = true;
+      res.writeHead(200, { "Content-Type": "text/plain; charset=utf-8" });
+    };
 
-    try {
-      const stream = await dockerStream(path);
-
-      // Close the Docker socket when the HTTP client disconnects.
-      // Without this, the Docker stream stays open and accumulates FDs.
-      req.on("close", () => stream.destroy());
-
-      stream.on("data", (chunk: Buffer) => {
-        res.write(stripDockerFraming(chunk));
-      });
-      stream.on("end", () => res.end());
-      stream.on("error", (e: Error) => {
+    const disposer = readContainerLogsFromJournal({
+      container,
+      tail,
+      onChunk: (chunk) => {
+        startStreaming();
+        res.write(chunk);
+      },
+      onEnd: () => {
+        startStreaming();
+        res.end();
+      },
+      onError: (e) => {
+        if (!headersSent) {
+          sendJson(res, 500, { error: `journalctl failed: ${e.message}` });
+          return;
+        }
         res.write(`\n[error reading logs: ${e.message}]\n`);
         res.end();
-      });
-    } catch (e: unknown) {
-      const msg = e instanceof Error ? e.message : String(e);
-      res.write(`[error: ${msg}]\n`);
-      res.end();
-    }
+      },
+    });
+    // Kill journalctl if the HTTP client disconnects mid-read.
+    req.on("close", disposer);
     return;
   }
 
@@ -510,10 +744,13 @@ server.listen(LOG_PORT, () => {
   console.log(`[monitor] Log server listening on port ${LOG_PORT}`);
   console.log(`[monitor] Targets: ${MONITOR_TARGETS.join(", ") || "(none)"}`);
   console.log(`[monitor] Health poll interval: ${HEALTH_POLL_INTERVAL_MS}ms`);
+  console.log(`[monitor] Stats poll interval: ${STATS_POLL_INTERVAL_MS}ms · history=${STATS_HISTORY_SIZE} · pressure=${MEMORY_PRESSURE_RATIO}×${MEMORY_PRESSURE_SUSTAINED}`);
   if (!DISCORD_WEBHOOK) console.warn("[monitor] DISCORD_ALARM_WEBHOOK not set — alarms disabled");
   if (!LOG_SERVER_TOKEN) console.warn("[monitor] LOG_SERVER_TOKEN not set — log API is open");
 });
 
 setInterval(() => void pollHealth(), HEALTH_POLL_INTERVAL_MS);
 void pollHealth(); // immediate first check
+setInterval(() => void pollStats(), STATS_POLL_INTERVAL_MS);
+void pollStats(); // immediate first sample
 void watchEvents();
