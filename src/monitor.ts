@@ -412,11 +412,27 @@ const STDERR_BUFFER_MAX = 64 * 1024;
 function readContainerLogsFromJournal(params: {
   container: string;
   tail: number;
+  /**
+   * Optional `journalctl --since` expression. When set, journalctl returns
+   * every entry from that instant onward — the `-n tail` cap still applies
+   * as a safety upper bound but the WINDOW is now time-based rather than
+   * line-count-based. Callers use this to reach logs older than `tail`
+   * lines' worth of history during a log-storm (e.g. an inbox retry storm
+   * generating ~1700 lines/min drowns the default 10k-line cap in 6 min;
+   * `since=30m ago` recovers the older, quieter pre-storm entries).
+   *
+   * journalctl accepts absolute (`2026-07-28 17:00:00`) or relative
+   * (`10m ago`, `2 hours ago`, `yesterday`) expressions per systemd.time(7).
+   * The caller is trusted to pass a well-formed value; a malformed one is
+   * surfaced as a journalctl-exit-nonzero error via the standard error
+   * pipeline below.
+   */
+  since?: string;
   onChunk: (buf: Buffer) => void;
   onEnd: () => void;
   onError: (err: Error) => void;
 }): () => void {
-  const { container, tail, onChunk, onEnd, onError } = params;
+  const { container, tail, since, onChunk, onEnd, onError } = params;
   const args = [
     `CONTAINER_NAME=${container}`,
     "-n",
@@ -424,6 +440,9 @@ function readContainerLogsFromJournal(params: {
     "--output=cat",
     "--no-pager",
   ];
+  if (since) {
+    args.push("--since", since);
+  }
   const child = spawn(JOURNALCTL_BIN, args, { stdio: ["ignore", "pipe", "pipe"] });
   let stderr = "";
   // `error` (ENOENT / spawn failure) and `close` (with nonzero code)
@@ -697,6 +716,36 @@ async function handleRequest(
     const tailRaw = parseInt(url.searchParams.get("tail") ?? "100", 10);
     const tail = Number.isFinite(tailRaw) && tailRaw > 0 && tailRaw <= 10_000 ? tailRaw : 100;
 
+    // Optional time-based window. journalctl's `--since` accepts absolute
+    // (`2026-07-28 17:00:00`) and relative (`10m ago`, `2 hours ago`,
+    // `yesterday`) forms per systemd.time(7). Combined with `-n tail`,
+    // this returns "at most `tail` entries from within the requested
+    // window", which is what triage needs during a log-storm — the tail
+    // cap alone can't reach older entries when the storm generates more
+    // lines than the cap.
+    //
+    // Length-capped defensively — a very long value could make
+    // journalctl parse-error at the process-arg boundary. 200 octets
+    // covers every legitimate expression comfortably (longest realistic
+    // form is ~44 chars: `2026-07-28+17:00:00+America/Los_Angeles`).
+    // Byte-cap via `Buffer.byteLength` because a multi-byte-UTF-8 value
+    // could otherwise smuggle past a naive char cap.
+    const sinceRaw = url.searchParams.get("since");
+    let since: string | undefined;
+    if (sinceRaw !== null && sinceRaw.length > 0) {
+      if (Buffer.byteLength(sinceRaw, "utf8") > 200) {
+        // Explicit 400 rather than silently dropping the filter. A silent
+        // drop would serve the default `-n 100` tail with no signal that
+        // the caller's window was ignored — the exact "wrong answer, no
+        // error" shape #13's premature-200 fix worked to eliminate.
+        sendJson(res, 400, {
+          error: "since must be 1-200 UTF-8 octets",
+        });
+        return;
+      }
+      since = sinceRaw;
+    }
+
     // Delay `writeHead` until first stdout chunk arrives. journalctl
     // spawn failures (missing binary, permission denied) previously
     // returned 200 with an error message in the body, so any consumer
@@ -711,6 +760,7 @@ async function handleRequest(
     const disposer = readContainerLogsFromJournal({
       container,
       tail,
+      since,
       onChunk: (chunk) => {
         startStreaming();
         res.write(chunk);
