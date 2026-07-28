@@ -724,14 +724,27 @@ async function handleRequest(
     // cap alone can't reach older entries when the storm generates more
     // lines than the cap.
     //
-    // Length-capped defensively — a malicious very long value could
-    // make journalctl parse-error at the process-arg boundary. 200
-    // bytes covers every legitimate expression and stops abuse.
+    // Length-capped defensively — a very long value could make
+    // journalctl parse-error at the process-arg boundary. 200 octets
+    // covers every legitimate expression comfortably (longest realistic
+    // form is ~44 chars: `2026-07-28+17:00:00+America/Los_Angeles`).
+    // Byte-cap via `Buffer.byteLength` because a multi-byte-UTF-8 value
+    // could otherwise smuggle past a naive char cap.
     const sinceRaw = url.searchParams.get("since");
-    const since =
-      sinceRaw && sinceRaw.length > 0 && sinceRaw.length <= 200
-        ? sinceRaw
-        : undefined;
+    let since: string | undefined;
+    if (sinceRaw !== null && sinceRaw.length > 0) {
+      if (Buffer.byteLength(sinceRaw, "utf8") > 200) {
+        // Explicit 400 rather than silently dropping the filter. A silent
+        // drop would serve the default `-n 100` tail with no signal that
+        // the caller's window was ignored — the exact "wrong answer, no
+        // error" shape #13's premature-200 fix worked to eliminate.
+        sendJson(res, 400, {
+          error: "since must be 1-200 UTF-8 octets",
+        });
+        return;
+      }
+      since = sinceRaw;
+    }
 
     // Delay `writeHead` until first stdout chunk arrives. journalctl
     // spawn failures (missing binary, permission denied) previously
