@@ -170,7 +170,7 @@ async function sendAlarm(
   lastAlarmAt[key] = now;
 
   const emoji =
-    type === "RECOVERY" ? "✅" : type === "RESTARTING" ? "🔄" : type === "HEALTHCHECK" ? "⚠️" : "🚨";
+    type === "RECOVERY" ? "✅" : type === "HEALTHCHECK" ? "⚠️" : "🚨";
   const content = [
     `${emoji} **[${type}]** \`${service}\``,
     `⏰ ${new Date().toISOString()}`,
@@ -244,10 +244,34 @@ async function pollHealth(): Promise<void> {
           await sendAlarm("HEALTHCHECK", name, `Health status: \`${current}\``);
         }
       } else if (current === "starting") {
-        // Container restarted — fire a RESTARTING alarm and reset the HEALTHCHECK
-        // cooldown so the next unhealthy poll fires immediately.
+        // Container is coming up. NO alarm — every path that reaches
+        // `starting` is either voluntary or already surfaced by another
+        // alarm type:
+        //
+        // - Involuntary crash / OOM: the docker-events handler below
+        //   fires CRASH on `oom` or `die` with non-graceful exit BEFORE
+        //   the container recreates and lands here. CRASH is event-
+        //   driven (no poll race) and specific ("Container killed by
+        //   OOM killer" / "exit code: 137"), so it's strictly more
+        //   useful than a RESTARTING follow-on.
+        // - Container hangs without exiting: HEALTHCHECK fires when the
+        //   healthcheck flips to `unhealthy`. That path doesn't reach
+        //   `starting` at all.
+        // - Deploy / `compose restart`: voluntary, no signal needed.
+        // - Initial boot: voluntary, no signal needed.
+        //
+        // Docker's restart policies fire on process EXIT (which
+        // triggers CRASH), not on healthcheck failure — so on plain
+        // docker-compose there's no involuntary path that produces
+        // `unhealthy → starting` without a prior CRASH. And the 60s
+        // health poll interval means a transient unhealthy transition
+        // between polls could hide from a `prev === "unhealthy"` gate
+        // anyway, giving false negatives. Dropping the alarm entirely
+        // avoids that whole class of misclassification.
         console.log(`[health] ${name}: restarting (prev=${prev})`);
-        await sendAlarm("RESTARTING", name, `Container restarting after \`${prev}\``);
+        // Always reset the HEALTHCHECK cooldown: a new container
+        // instance is starting and its first unhealthy poll should fire
+        // immediately, not sit under the old instance's cooldown.
         delete lastAlarmAt[`HEALTHCHECK:${name}`];
         healthFailCount[name] = 0;
       } else {
