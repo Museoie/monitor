@@ -244,10 +244,32 @@ async function pollHealth(): Promise<void> {
           await sendAlarm("HEALTHCHECK", name, `Health status: \`${current}\``);
         }
       } else if (current === "starting") {
-        // Container restarted — fire a RESTARTING alarm and reset the HEALTHCHECK
-        // cooldown so the next unhealthy poll fires immediately.
+        // Container is coming up. Only alarm on `unhealthy → starting` —
+        // that's the "docker-restarted a sick container" signal (or an
+        // operator's manual recovery). Every other → starting transition
+        // is voluntary (deploy pulls a new image, `compose restart`) or
+        // initial boot; alarming on those spams the channel and treats
+        // routine ops as incidents.
+        //
+        // The involuntary-restart signal from OOM / non-graceful exit is
+        // ALREADY covered by the CRASH alarm in the docker-events handler
+        // below (`die` with non-graceful exit code, or `oom`). Those
+        // events fire BEFORE the container recreates and lands here in
+        // `starting`, so suppressing the healthy → starting RESTARTING
+        // alarm doesn't lose crash visibility — CRASH already told the
+        // story.
         console.log(`[health] ${name}: restarting (prev=${prev})`);
-        await sendAlarm("RESTARTING", name, `Container restarting after \`${prev}\``);
+        if (prev === "unhealthy") {
+          await sendAlarm(
+            "RESTARTING",
+            name,
+            `Container restarting after \`${prev}\``,
+          );
+        }
+        // Always reset the HEALTHCHECK cooldown regardless of whether we
+        // alarmed — a new container instance is starting and its first
+        // unhealthy poll should fire immediately, not sit under the old
+        // instance's cooldown.
         delete lastAlarmAt[`HEALTHCHECK:${name}`];
         healthFailCount[name] = 0;
       } else {
