@@ -170,7 +170,7 @@ async function sendAlarm(
   lastAlarmAt[key] = now;
 
   const emoji =
-    type === "RECOVERY" ? "✅" : type === "RESTARTING" ? "🔄" : type === "HEALTHCHECK" ? "⚠️" : "🚨";
+    type === "RECOVERY" ? "✅" : type === "HEALTHCHECK" ? "⚠️" : "🚨";
   const content = [
     `${emoji} **[${type}]** \`${service}\``,
     `⏰ ${new Date().toISOString()}`,
@@ -244,32 +244,34 @@ async function pollHealth(): Promise<void> {
           await sendAlarm("HEALTHCHECK", name, `Health status: \`${current}\``);
         }
       } else if (current === "starting") {
-        // Container is coming up. Only alarm on `unhealthy → starting` —
-        // that's the "docker-restarted a sick container" signal (or an
-        // operator's manual recovery). Every other → starting transition
-        // is voluntary (deploy pulls a new image, `compose restart`) or
-        // initial boot; alarming on those spams the channel and treats
-        // routine ops as incidents.
+        // Container is coming up. NO alarm — every path that reaches
+        // `starting` is either voluntary or already surfaced by another
+        // alarm type:
         //
-        // The involuntary-restart signal from OOM / non-graceful exit is
-        // ALREADY covered by the CRASH alarm in the docker-events handler
-        // below (`die` with non-graceful exit code, or `oom`). Those
-        // events fire BEFORE the container recreates and lands here in
-        // `starting`, so suppressing the healthy → starting RESTARTING
-        // alarm doesn't lose crash visibility — CRASH already told the
-        // story.
+        // - Involuntary crash / OOM: the docker-events handler below
+        //   fires CRASH on `oom` or `die` with non-graceful exit BEFORE
+        //   the container recreates and lands here. CRASH is event-
+        //   driven (no poll race) and specific ("Container killed by
+        //   OOM killer" / "exit code: 137"), so it's strictly more
+        //   useful than a RESTARTING follow-on.
+        // - Container hangs without exiting: HEALTHCHECK fires when the
+        //   healthcheck flips to `unhealthy`. That path doesn't reach
+        //   `starting` at all.
+        // - Deploy / `compose restart`: voluntary, no signal needed.
+        // - Initial boot: voluntary, no signal needed.
+        //
+        // Docker's restart policies fire on process EXIT (which
+        // triggers CRASH), not on healthcheck failure — so on plain
+        // docker-compose there's no involuntary path that produces
+        // `unhealthy → starting` without a prior CRASH. And the 60s
+        // health poll interval means a transient unhealthy transition
+        // between polls could hide from a `prev === "unhealthy"` gate
+        // anyway, giving false negatives. Dropping the alarm entirely
+        // avoids that whole class of misclassification.
         console.log(`[health] ${name}: restarting (prev=${prev})`);
-        if (prev === "unhealthy") {
-          await sendAlarm(
-            "RESTARTING",
-            name,
-            `Container restarting after \`${prev}\``,
-          );
-        }
-        // Always reset the HEALTHCHECK cooldown regardless of whether we
-        // alarmed — a new container instance is starting and its first
-        // unhealthy poll should fire immediately, not sit under the old
-        // instance's cooldown.
+        // Always reset the HEALTHCHECK cooldown: a new container
+        // instance is starting and its first unhealthy poll should fire
+        // immediately, not sit under the old instance's cooldown.
         delete lastAlarmAt[`HEALTHCHECK:${name}`];
         healthFailCount[name] = 0;
       } else {
