@@ -41,11 +41,11 @@ const JOURNALCTL_BIN = process.env.JOURNALCTL_BIN ?? "journalctl";
 // Tightened default to 20s (was 60s). Typical OOM lead time from
 // 85%→kill is 10-60s under sustained load; a 3× minute poll cadence
 // often missed the pre-death signal the alarm exists to catch.
-const STATS_POLL_INTERVAL_MS = parseIntEnv("STATS_POLL_INTERVAL_MS", 20000);
+const STATS_POLL_INTERVAL_MS = parseIntEnv("STATS_POLL_INTERVAL_MS", 20_000);
 const STATS_HISTORY_SIZE = parseIntEnv("STATS_HISTORY_SIZE", 60);
 const MEMORY_PRESSURE_RATIO = parseFloatEnv("MEMORY_PRESSURE_RATIO", 0.85);
 const MEMORY_PRESSURE_SUSTAINED = parseIntEnv("MEMORY_PRESSURE_SUSTAINED", 3);
-const JOURNALCTL_TIMEOUT_MS = parseIntEnv("JOURNALCTL_TIMEOUT_MS", 15000);
+const JOURNALCTL_TIMEOUT_MS = parseIntEnv("JOURNALCTL_TIMEOUT_MS", 15_000);
 // Host RAM ceiling. Docker reports `memory_stats.limit` as host total
 // when a container has no `--memory` cap; treating that as a real
 // limit yields misleading `usage_ratio` values (a 4 GB app on 128 GB
@@ -135,7 +135,7 @@ async function sendAlarm(type, service, detail) {
         return; // cooldown active
     }
     lastAlarmAt[key] = now;
-    const emoji = type === "RECOVERY" ? "✅" : type === "RESTARTING" ? "🔄" : type === "HEALTHCHECK" ? "⚠️" : "🚨";
+    const emoji = type === "RECOVERY" ? "✅" : type === "HEALTHCHECK" ? "⚠️" : "🚨";
     const content = [
         `${emoji} **[${type}]** \`${service}\``,
         `⏰ ${new Date().toISOString()}`,
@@ -186,10 +186,34 @@ async function pollHealth() {
                 }
             }
             else if (current === "starting") {
-                // Container restarted — fire a RESTARTING alarm and reset the HEALTHCHECK
-                // cooldown so the next unhealthy poll fires immediately.
+                // Container is coming up. NO alarm — every path that reaches
+                // `starting` is either voluntary or already surfaced by another
+                // alarm type:
+                //
+                // - Involuntary crash / OOM: the docker-events handler below
+                //   fires CRASH on `oom` or `die` with non-graceful exit BEFORE
+                //   the container recreates and lands here. CRASH is event-
+                //   driven (no poll race) and specific ("Container killed by
+                //   OOM killer" / "exit code: 137"), so it's strictly more
+                //   useful than a RESTARTING follow-on.
+                // - Container hangs without exiting: HEALTHCHECK fires when the
+                //   healthcheck flips to `unhealthy`. That path doesn't reach
+                //   `starting` at all.
+                // - Deploy / `compose restart`: voluntary, no signal needed.
+                // - Initial boot: voluntary, no signal needed.
+                //
+                // Docker's restart policies fire on process EXIT (which
+                // triggers CRASH), not on healthcheck failure — so on plain
+                // docker-compose there's no involuntary path that produces
+                // `unhealthy → starting` without a prior CRASH. And the 60s
+                // health poll interval means a transient unhealthy transition
+                // between polls could hide from a `prev === "unhealthy"` gate
+                // anyway, giving false negatives. Dropping the alarm entirely
+                // avoids that whole class of misclassification.
                 console.log(`[health] ${name}: restarting (prev=${prev})`);
-                await sendAlarm("RESTARTING", name, `Container restarting after \`${prev}\``);
+                // Always reset the HEALTHCHECK cooldown: a new container
+                // instance is starting and its first unhealthy poll should fire
+                // immediately, not sit under the old instance's cooldown.
                 delete lastAlarmAt[`HEALTHCHECK:${name}`];
                 healthFailCount[name] = 0;
             }
@@ -304,7 +328,7 @@ async function pollStats() {
  */
 const STDERR_BUFFER_MAX = 64 * 1024;
 function readContainerLogsFromJournal(params) {
-    const { container, tail, onChunk, onEnd, onError } = params;
+    const { container, tail, since, onChunk, onEnd, onError } = params;
     const args = [
         `CONTAINER_NAME=${container}`,
         "-n",
@@ -312,6 +336,9 @@ function readContainerLogsFromJournal(params) {
         "--output=cat",
         "--no-pager",
     ];
+    if (since) {
+        args.push("--since", since);
+    }
     const child = (0, child_process_1.spawn)(JOURNALCTL_BIN, args, { stdio: ["ignore", "pipe", "pipe"] });
     let stderr = "";
     // `error` (ENOENT / spawn failure) and `close` (with nonzero code)
@@ -432,17 +459,17 @@ async function watchEvents() {
         });
         stream.on("end", () => {
             console.error("[events] stream ended, reconnecting in 5s...");
-            setTimeout(() => void watchEvents(), 5000);
+            setTimeout(() => void watchEvents(), 5_000);
         });
         stream.on("error", (e) => {
             console.error("[events] stream error:", e.message, "— reconnecting in 5s");
-            setTimeout(() => void watchEvents(), 5000);
+            setTimeout(() => void watchEvents(), 5_000);
         });
     }
     catch (e) {
         const msg = e instanceof Error ? e.message : String(e);
         console.error("[events] connect failed:", msg, "— retrying in 5s");
-        setTimeout(() => void watchEvents(), 5000);
+        setTimeout(() => void watchEvents(), 5_000);
     }
 }
 // ---------------------------------------------------------------------------
@@ -552,7 +579,36 @@ async function handleRequest(req, res) {
         // reach journalctl and either error out or return an unbounded
         // history. Clamp to [1, 10000] and default to 100.
         const tailRaw = parseInt(url.searchParams.get("tail") ?? "100", 10);
-        const tail = Number.isFinite(tailRaw) && tailRaw > 0 && tailRaw <= 10000 ? tailRaw : 100;
+        const tail = Number.isFinite(tailRaw) && tailRaw > 0 && tailRaw <= 10_000 ? tailRaw : 100;
+        // Optional time-based window. journalctl's `--since` accepts absolute
+        // (`2026-07-28 17:00:00`) and relative (`10m ago`, `2 hours ago`,
+        // `yesterday`) forms per systemd.time(7). Combined with `-n tail`,
+        // this returns "at most `tail` entries from within the requested
+        // window", which is what triage needs during a log-storm — the tail
+        // cap alone can't reach older entries when the storm generates more
+        // lines than the cap.
+        //
+        // Length-capped defensively — a very long value could make
+        // journalctl parse-error at the process-arg boundary. 200 octets
+        // covers every legitimate expression comfortably (longest realistic
+        // form is ~44 chars: `2026-07-28+17:00:00+America/Los_Angeles`).
+        // Byte-cap via `Buffer.byteLength` because a multi-byte-UTF-8 value
+        // could otherwise smuggle past a naive char cap.
+        const sinceRaw = url.searchParams.get("since");
+        let since;
+        if (sinceRaw !== null && sinceRaw.length > 0) {
+            if (Buffer.byteLength(sinceRaw, "utf8") > 200) {
+                // Explicit 400 rather than silently dropping the filter. A silent
+                // drop would serve the default `-n 100` tail with no signal that
+                // the caller's window was ignored — the exact "wrong answer, no
+                // error" shape #13's premature-200 fix worked to eliminate.
+                sendJson(res, 400, {
+                    error: "since must be 1-200 UTF-8 octets",
+                });
+                return;
+            }
+            since = sinceRaw;
+        }
         // Delay `writeHead` until first stdout chunk arrives. journalctl
         // spawn failures (missing binary, permission denied) previously
         // returned 200 with an error message in the body, so any consumer
@@ -567,6 +623,7 @@ async function handleRequest(req, res) {
         const disposer = readContainerLogsFromJournal({
             container,
             tail,
+            since,
             onChunk: (chunk) => {
                 startStreaming();
                 res.write(chunk);
