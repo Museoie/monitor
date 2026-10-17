@@ -257,6 +257,30 @@ function calcCpuPercent(s) {
         return null;
     return Math.round((cpuDelta / systemDelta) * onlineCpus * 100 * 10) / 10;
 }
+/**
+ * Inactive file cache in bytes, from cgroup v1's `total_inactive_file` or
+ * cgroup v2's `inactive_file`. Null when Docker reports neither.
+ */
+function inactiveFileBytes(mem) {
+    return mem?.stats?.total_inactive_file ?? mem?.stats?.inactive_file ?? null;
+}
+/**
+ * Memory the container can't give back without OOM risk: usage minus inactive
+ * file cache, the same figure `docker stats` reports as MEM USAGE. Mirrors the
+ * Docker CLI: `total_inactive_file` if below usage, else `inactive_file` if
+ * below usage, else raw usage.
+ */
+function calcWorkingSetBytes(mem) {
+    const usage = mem?.usage ?? 0;
+    const totalInactiveFile = mem?.stats?.total_inactive_file;
+    if (totalInactiveFile !== undefined && totalInactiveFile < usage) {
+        return usage - totalInactiveFile;
+    }
+    const inactiveFile = mem?.stats?.inactive_file;
+    if (inactiveFile !== undefined && inactiveFile < usage)
+        return usage - inactiveFile;
+    return usage;
+}
 async function pollStats() {
     for (const name of MONITOR_TARGETS) {
         try {
@@ -264,6 +288,8 @@ async function pollStats() {
             if (status !== 200)
                 continue;
             const usage = body.memory_stats?.usage ?? 0;
+            const workingSet = calcWorkingSetBytes(body.memory_stats);
+            const memStats = body.memory_stats?.stats;
             const limit = body.memory_stats?.limit ?? null;
             // Docker reports the host's total RAM as "limit" when the
             // container has no explicit `--memory` cap. Ratios computed
@@ -272,11 +298,15 @@ async function pollStats() {
             // Use `IS_UNLIMITED` (defined at top with the host-mem read) so
             // `/stats` reports `null` and the alarm block skips this
             // container consistently.
-            const usageRatio = IS_UNLIMITED(limit) ? null : usage / limit;
+            const usageRatio = IS_UNLIMITED(limit) ? null : workingSet / limit;
             const cpuPercent = calcCpuPercent(body);
             const sample = {
                 ts: body.read ?? new Date().toISOString(),
                 usage_bytes: usage,
+                working_set_bytes: workingSet,
+                anon_bytes: memStats?.anon ?? memStats?.total_rss ?? null,
+                file_bytes: memStats?.file ?? memStats?.total_cache ?? null,
+                inactive_file_bytes: inactiveFileBytes(body.memory_stats),
                 limit_bytes: limit,
                 usage_ratio: usageRatio,
                 cpu_percent: cpuPercent,
@@ -297,9 +327,10 @@ async function pollStats() {
                 pressureCount[name] = (pressureCount[name] ?? 0) + 1;
                 if (pressureCount[name] >= MEMORY_PRESSURE_SUSTAINED) {
                     const pct = Math.round(usageRatio * 100);
+                    const workingSetMB = Math.round(workingSet / 1024 / 1024);
                     const usageMB = Math.round(usage / 1024 / 1024);
                     const limitMB = limit ? Math.round(limit / 1024 / 1024) : "?";
-                    await sendAlarm("MEMORY_PRESSURE", name, `Memory at ${pct}% of container limit (${usageMB} MB / ${limitMB} MB) sustained across ${MEMORY_PRESSURE_SUSTAINED}+ polls — OOM likely if trend continues.`);
+                    await sendAlarm("MEMORY_PRESSURE", name, `Memory at ${pct}% of container limit (${workingSetMB} MB / ${limitMB} MB working set, ${usageMB} MB with page cache) sustained across ${MEMORY_PRESSURE_SUSTAINED}+ polls — OOM likely if trend continues.`);
                 }
             }
             else if (usageRatio !== null) {
