@@ -53,11 +53,11 @@ The user running monitor (via pm2) needs read access to the journal — either r
 | `GET /containers` | Bearer token | List running containers |
 | `GET /logs/:container` | Bearer token | Last 100 log lines |
 | `GET /logs/:container?tail=500` | Bearer token | Configurable tail |
-| `GET /stats/:container` | Bearer token | Current + up-to-hour ring buffer of Docker stats (RSS, memory limit, usage ratio, CPU %) |
+| `GET /stats/:container` | Bearer token | Current + up-to-hour ring buffer of Docker stats (memory usage, working set, anon/file/inactive-file breakdown, memory limit, usage ratio, CPU %) |
 
 Auth: `Authorization: Bearer $LOG_SERVER_TOKEN`
 
-Stats are polled from the Docker socket (`/containers/{name}/stats?stream=false`), so they reflect cgroup-derived memory + CPU exactly the way `docker stats` does. A `MEMORY_PRESSURE` alarm fires to Discord when a container's `memory_stats.usage / memory_stats.limit` stays above `MEMORY_PRESSURE_RATIO` for `MEMORY_PRESSURE_SUSTAINED` consecutive samples — early warning before the kernel OOM-kills the container. Only fires when the container has an explicit `--memory` / `mem_limit` set (no explicit limit → the "limit" Docker reports is host RAM, making the ratio uninformative).
+Stats are polled from the Docker socket (`/containers/{name}/stats?stream=false`), so they reflect cgroup-derived memory + CPU exactly the way `docker stats` does. Memory pressure is measured on the working set — `memory_stats.usage` minus inactive file cache (`inactive_file` on cgroup v2, `total_inactive_file` on v1), the figure `docker stats` shows as MEM USAGE — because the kernel reclaims that cache before it OOM-kills. A `MEMORY_PRESSURE` alarm fires to Discord when a container's working set / `memory_stats.limit` stays above `MEMORY_PRESSURE_RATIO` for `MEMORY_PRESSURE_SUSTAINED` consecutive samples — early warning before the kernel OOM-kills the container. Only fires when the container has an explicit `--memory` / `mem_limit` set (no explicit limit → the "limit" Docker reports is host RAM, making the ratio uninformative).
 
 ## Environment Variables
 
@@ -75,7 +75,7 @@ Stats are polled from the Docker socket (`/containers/{name}/stats?stream=false`
 | `STATS_POLL_INTERVAL_MS` | no | `20000` | Docker stats poll interval per container |
 | `JOURNALCTL_TIMEOUT_MS` | no | `15000` | Hard-kill `journalctl` if it hangs |
 | `STATS_HISTORY_SIZE` | no | `60` | Samples kept in the ring buffer (default = 1 hour at 60s interval) |
-| `MEMORY_PRESSURE_RATIO` | no | `0.85` | Alarm when `usage / limit` ≥ this ratio |
+| `MEMORY_PRESSURE_RATIO` | no | `0.85` | Alarm when `working set / limit` ≥ this ratio |
 | `MEMORY_PRESSURE_SUSTAINED` | no | `3` | Consecutive polls required before alarming |
 
 ## Design Doc
