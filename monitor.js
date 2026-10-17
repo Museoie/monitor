@@ -266,13 +266,20 @@ function inactiveFileBytes(mem) {
 }
 /**
  * Memory the container can't give back without OOM risk: usage minus inactive
- * file cache, the same figure `docker stats` reports as MEM USAGE. Falls back
- * to raw usage when the cache figure is missing or larger than usage.
+ * file cache, the same figure `docker stats` reports as MEM USAGE. Mirrors the
+ * Docker CLI: `total_inactive_file` if below usage, else `inactive_file` if
+ * below usage, else raw usage.
  */
 function calcWorkingSetBytes(mem) {
     const usage = mem?.usage ?? 0;
-    const inactiveFile = inactiveFileBytes(mem);
-    return inactiveFile !== null && inactiveFile < usage ? usage - inactiveFile : usage;
+    const totalInactiveFile = mem?.stats?.total_inactive_file;
+    if (totalInactiveFile !== undefined && totalInactiveFile < usage) {
+        return usage - totalInactiveFile;
+    }
+    const inactiveFile = mem?.stats?.inactive_file;
+    if (inactiveFile !== undefined && inactiveFile < usage)
+        return usage - inactiveFile;
+    return usage;
 }
 async function pollStats() {
     for (const name of MONITOR_TARGETS) {

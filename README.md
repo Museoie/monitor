@@ -53,7 +53,7 @@ The user running monitor (via pm2) needs read access to the journal — either r
 | `GET /containers` | Bearer token | List running containers |
 | `GET /logs/:container` | Bearer token | Last 100 log lines |
 | `GET /logs/:container?tail=500` | Bearer token | Configurable tail |
-| `GET /stats/:container` | Bearer token | Current + up-to-hour ring buffer of Docker stats (memory usage, working set, anon/file/inactive-file breakdown, memory limit, usage ratio, CPU %) |
+| `GET /stats/:container` | Bearer token | Current + up-to-hour ring buffer of Docker stats (memory usage, working set, anon/file/inactive-file breakdown, memory limit, usage ratio (working set / limit), CPU %) |
 
 Auth: `Authorization: Bearer $LOG_SERVER_TOKEN`
 
