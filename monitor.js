@@ -167,6 +167,10 @@ async function sendAlarm(type, service, detail) {
 }
 const healthFailCount = {};
 const healthState = {};
+// Containers that sent CRASH and have not been seen running healthy since.
+// A crash restarts through `starting`, never `unhealthy`, so the
+// healthcheck path below cannot report its recovery.
+const awaitingRecovery = new Set();
 async function pollHealth() {
     for (const name of MONITOR_TARGETS) {
         try {
@@ -219,9 +223,13 @@ async function pollHealth() {
             }
             else {
                 // healthy (or unknown state)
-                if ((healthFailCount[name] ?? 0) >= HEALTH_FAIL_THRESHOLD && prev === "unhealthy" && current === "healthy") {
+                const healthRestored = (healthFailCount[name] ?? 0) >= HEALTH_FAIL_THRESHOLD && prev === "unhealthy" && current === "healthy";
+                const backAfterCrash = awaitingRecovery.has(name) && body.State?.Running === true && (current === "healthy" || current === "none");
+                if (healthRestored || backAfterCrash) {
+                    awaitingRecovery.delete(name);
                     console.log(`[health] ${name}: recovered → ${current}`);
-                    await sendAlarm("RECOVERY", name, `Health restored: \`${current}\``);
+                    const detail = healthRestored ? "Health restored" : "Back up after crash";
+                    await sendAlarm("RECOVERY", name, `${detail}: \`${current}\``);
                 }
                 healthFailCount[name] = 0;
             }
@@ -459,6 +467,7 @@ async function watchEvents() {
                         continue;
                     if (action === "oom") {
                         console.error(`[events] ${name}: OOM kill`);
+                        awaitingRecovery.add(name);
                         sendAlarm("CRASH", name, "Container killed by OOM killer").catch((e) => {
                             console.error("[events] sendAlarm failed:", e instanceof Error ? e.message : String(e));
                         });
@@ -478,6 +487,7 @@ async function watchEvents() {
                             continue;
                         }
                         console.error(`[events] ${name}: die (exit=${exitDisplay}) — crash`);
+                        awaitingRecovery.add(name);
                         sendAlarm("CRASH", name, `Container exited unexpectedly (exit code: \`${exitDisplay}\`)`).catch((e) => {
                             console.error("[events] sendAlarm failed:", e instanceof Error ? e.message : String(e));
                         });
