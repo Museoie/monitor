@@ -214,11 +214,34 @@ interface ContainerJson {
   State?: {
     Health?: { Status?: string };
     Running?: boolean;
+    Restarting?: boolean;
+    StartedAt?: string;
   };
 }
 
 const healthFailCount: Record<string, number> = {};
 const healthState: Record<string, string> = {};
+// Crash time (ms) of each container that sent CRASH and has not been reported
+// back up. The healthcheck path can't report these: the restart passes through
+// `starting`, which resets healthFailCount.
+const crashedAt: Record<string, number> = {};
+
+function markCrashed(name: string, eventTimeNano: number | undefined): void {
+  crashedAt[name] = eventTimeNano ? eventTimeNano / 1e6 : Date.now();
+  delete lastAlarmAt[`RECOVERY:${name}`];
+}
+
+// A container is back once an instance started after the crash is out of
+// Docker's restart backoff (which reports Running) and has proven itself:
+// healthy, or with no healthcheck, still up one poll interval later.
+function isBackAfterCrash(name: string, state: ContainerJson["State"], health: string): boolean {
+  const crashTime = crashedAt[name];
+  const startedAt = Date.parse(state?.StartedAt ?? "");
+  if (crashTime === undefined || state?.Running !== true || state.Restarting === true) return false;
+  if (!(startedAt > crashTime)) return false;
+  if (health === "healthy") return true;
+  return health === "none" && Date.now() - startedAt >= HEALTH_POLL_INTERVAL_MS;
+}
 
 async function pollHealth(): Promise<void> {
   for (const name of MONITOR_TARGETS) {
@@ -276,9 +299,14 @@ async function pollHealth(): Promise<void> {
         healthFailCount[name] = 0;
       } else {
         // healthy (or unknown state)
-        if ((healthFailCount[name] ?? 0) >= HEALTH_FAIL_THRESHOLD && prev === "unhealthy" && current === "healthy") {
+        const healthRestored =
+          (healthFailCount[name] ?? 0) >= HEALTH_FAIL_THRESHOLD && prev === "unhealthy" && current === "healthy";
+        const backAfterCrash = isBackAfterCrash(name, body.State, current);
+        if (healthRestored || backAfterCrash) {
+          delete crashedAt[name];
           console.log(`[health] ${name}: recovered → ${current}`);
-          await sendAlarm("RECOVERY", name, `Health restored: \`${current}\``);
+          const detail = healthRestored ? "Health restored" : "Back up after crash";
+          await sendAlarm("RECOVERY", name, `${detail}: \`${current}\``);
         }
         healthFailCount[name] = 0;
       }
@@ -585,6 +613,7 @@ async function watchEvents(): Promise<void> {
           const event = JSON.parse(line) as {
             Action: string;
             Actor: { Attributes: { name: string; exitCode?: string } };
+            timeNano?: number;
           };
           const action = event.Action;
           const name = event.Actor?.Attributes?.name ?? "";
@@ -597,6 +626,7 @@ async function watchEvents(): Promise<void> {
 
           if (action === "oom") {
             console.error(`[events] ${name}: OOM kill`);
+            markCrashed(name, event.timeNano);
             sendAlarm("CRASH", name, "Container killed by OOM killer").catch(
               (e: unknown) => {
                 console.error("[events] sendAlarm failed:", e instanceof Error ? e.message : String(e));
@@ -622,6 +652,7 @@ async function watchEvents(): Promise<void> {
             }
 
             console.error(`[events] ${name}: die (exit=${exitDisplay}) — crash`);
+            markCrashed(name, event.timeNano);
             sendAlarm(
               "CRASH",
               name,
