@@ -167,10 +167,28 @@ async function sendAlarm(type, service, detail) {
 }
 const healthFailCount = {};
 const healthState = {};
-// Containers that sent CRASH and have not been seen running healthy since.
-// A crash restarts through `starting`, never `unhealthy`, so the
-// healthcheck path below cannot report its recovery.
-const awaitingRecovery = new Set();
+// Crash time (ms) of each container that sent CRASH and has not been reported
+// back up. The healthcheck path can't report these: the restart passes through
+// `starting`, which resets healthFailCount.
+const crashedAt = {};
+function markCrashed(name, eventTimeNano) {
+    crashedAt[name] = eventTimeNano ? eventTimeNano / 1e6 : Date.now();
+    delete lastAlarmAt[`RECOVERY:${name}`];
+}
+// A container is back once an instance started after the crash is out of
+// Docker's restart backoff (which reports Running) and has proven itself:
+// healthy, or with no healthcheck, still up one poll interval later.
+function isBackAfterCrash(name, state, health) {
+    const crashTime = crashedAt[name];
+    const startedAt = Date.parse(state?.StartedAt ?? "");
+    if (crashTime === undefined || state?.Running !== true || state.Restarting === true)
+        return false;
+    if (!(startedAt > crashTime))
+        return false;
+    if (health === "healthy")
+        return true;
+    return health === "none" && Date.now() - startedAt >= HEALTH_POLL_INTERVAL_MS;
+}
 async function pollHealth() {
     for (const name of MONITOR_TARGETS) {
         try {
@@ -224,9 +242,9 @@ async function pollHealth() {
             else {
                 // healthy (or unknown state)
                 const healthRestored = (healthFailCount[name] ?? 0) >= HEALTH_FAIL_THRESHOLD && prev === "unhealthy" && current === "healthy";
-                const backAfterCrash = awaitingRecovery.has(name) && body.State?.Running === true && (current === "healthy" || current === "none");
+                const backAfterCrash = isBackAfterCrash(name, body.State, current);
                 if (healthRestored || backAfterCrash) {
-                    awaitingRecovery.delete(name);
+                    delete crashedAt[name];
                     console.log(`[health] ${name}: recovered → ${current}`);
                     const detail = healthRestored ? "Health restored" : "Back up after crash";
                     await sendAlarm("RECOVERY", name, `${detail}: \`${current}\``);
@@ -467,7 +485,7 @@ async function watchEvents() {
                         continue;
                     if (action === "oom") {
                         console.error(`[events] ${name}: OOM kill`);
-                        awaitingRecovery.add(name);
+                        markCrashed(name, event.timeNano);
                         sendAlarm("CRASH", name, "Container killed by OOM killer").catch((e) => {
                             console.error("[events] sendAlarm failed:", e instanceof Error ? e.message : String(e));
                         });
@@ -487,7 +505,7 @@ async function watchEvents() {
                             continue;
                         }
                         console.error(`[events] ${name}: die (exit=${exitDisplay}) — crash`);
-                        awaitingRecovery.add(name);
+                        markCrashed(name, event.timeNano);
                         sendAlarm("CRASH", name, `Container exited unexpectedly (exit code: \`${exitDisplay}\`)`).catch((e) => {
                             console.error("[events] sendAlarm failed:", e instanceof Error ? e.message : String(e));
                         });
