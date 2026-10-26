@@ -135,9 +135,18 @@ let targets = MONITOR_PROJECT ? [] : MONITOR_TARGETS;
 function isProjectService(labels) {
     return labels?.[PROJECT_LABEL] === MONITOR_PROJECT && labels?.[ONEOFF_LABEL] !== "True";
 }
-async function refreshTargets() {
+let discovered = false;
+let refreshing = null;
+/** Health and stats polls share one in-flight lookup so an older answer can't overwrite a newer one. */
+function refreshTargets() {
     if (!MONITOR_PROJECT)
-        return;
+        return Promise.resolve();
+    refreshing ??= discoverTargets().finally(() => {
+        refreshing = null;
+    });
+    return refreshing;
+}
+async function discoverTargets() {
     // `all` keeps stopped and crashed containers in the set until they are removed.
     const filters = encodeURIComponent(JSON.stringify({ label: [`${PROJECT_LABEL}=${MONITOR_PROJECT}`] }));
     try {
@@ -151,16 +160,20 @@ async function refreshTargets() {
             .map((c) => (c.Names?.[0] ?? "").replace(/^\//, ""))
             .filter(Boolean)
             .sort();
-        if (next.join(",") !== targets.join(",")) {
-            console.log(`[targets] ${next.join(", ") || "(none)"}`);
-            for (const name of targets) {
-                if (next.includes(name))
-                    continue;
-                for (const state of [healthState, healthFailCount, crashedAt, statsHistory, pressureCount])
-                    delete state[name];
-            }
-            targets = next;
+        if (discovered && next.join(",") === targets.join(","))
+            return;
+        discovered = true;
+        if (next.length)
+            console.log(`[targets] ${next.join(", ")}`);
+        else
+            console.warn(`[targets] no containers in compose project "${MONITOR_PROJECT}"`);
+        for (const name of targets) {
+            if (next.includes(name))
+                continue;
+            for (const state of [healthState, healthFailCount, crashedAt, statsHistory, pressureCount])
+                delete state[name];
         }
+        targets = next;
     }
     catch (e) {
         console.warn("[targets] container list failed:", e instanceof Error ? e.message : String(e));

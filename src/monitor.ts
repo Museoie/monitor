@@ -165,8 +165,19 @@ function isProjectService(labels: Record<string, string> | undefined): boolean {
   return labels?.[PROJECT_LABEL] === MONITOR_PROJECT && labels?.[ONEOFF_LABEL] !== "True";
 }
 
-async function refreshTargets(): Promise<void> {
-  if (!MONITOR_PROJECT) return;
+let discovered = false;
+let refreshing: Promise<void> | null = null;
+
+/** Health and stats polls share one in-flight lookup so an older answer can't overwrite a newer one. */
+function refreshTargets(): Promise<void> {
+  if (!MONITOR_PROJECT) return Promise.resolve();
+  refreshing ??= discoverTargets().finally(() => {
+    refreshing = null;
+  });
+  return refreshing;
+}
+
+async function discoverTargets(): Promise<void> {
   // `all` keeps stopped and crashed containers in the set until they are removed.
   const filters = encodeURIComponent(JSON.stringify({ label: [`${PROJECT_LABEL}=${MONITOR_PROJECT}`] }));
   try {
@@ -183,14 +194,15 @@ async function refreshTargets(): Promise<void> {
       .map((c) => (c.Names?.[0] ?? "").replace(/^\//, ""))
       .filter(Boolean)
       .sort();
-    if (next.join(",") !== targets.join(",")) {
-      console.log(`[targets] ${next.join(", ") || "(none)"}`);
-      for (const name of targets) {
-        if (next.includes(name)) continue;
-        for (const state of [healthState, healthFailCount, crashedAt, statsHistory, pressureCount]) delete state[name];
-      }
-      targets = next;
+    if (discovered && next.join(",") === targets.join(",")) return;
+    discovered = true;
+    if (next.length) console.log(`[targets] ${next.join(", ")}`);
+    else console.warn(`[targets] no containers in compose project "${MONITOR_PROJECT}"`);
+    for (const name of targets) {
+      if (next.includes(name)) continue;
+      for (const state of [healthState, healthFailCount, crashedAt, statsHistory, pressureCount]) delete state[name];
     }
+    targets = next;
   } catch (e: unknown) {
     console.warn("[targets] container list failed:", e instanceof Error ? e.message : String(e));
   }
