@@ -93,10 +93,11 @@ function readHostMemTotalBytes() {
 // cap is orders of magnitude lower on our hosts. Used by both
 // `pollStats` and `/stats` to skip the misleading ratio.
 const IS_UNLIMITED = (limit) => limit == null || limit <= 0 || limit >= HOST_MEM_TOTAL_BYTES * 0.9;
-function dockerRequest(method, path) {
+function dockerRequest(method, path, timeoutMs) {
     return new Promise((resolve, reject) => {
         const req = http_1.default.request({ socketPath: DOCKER_SOCKET, method, path }, (res) => {
             const chunks = [];
+            res.on("error", reject);
             res.on("data", (chunk) => chunks.push(chunk));
             res.on("end", () => {
                 const raw = Buffer.concat(chunks).toString();
@@ -109,6 +110,9 @@ function dockerRequest(method, path) {
             });
         });
         req.on("error", reject);
+        if (timeoutMs) {
+            req.setTimeout(timeoutMs, () => req.destroy(new Error(`timed out after ${timeoutMs}ms`)));
+        }
         req.end();
     });
 }
@@ -125,6 +129,8 @@ function dockerStream(path) {
 // ---------------------------------------------------------------------------
 const PROJECT_LABEL = "com.docker.compose.project";
 const ONEOFF_LABEL = "com.docker.compose.oneoff";
+// Every poll waits on the shared lookup, so it must not be able to hang.
+const DISCOVERY_TIMEOUT_MS = 10_000;
 /**
  * Containers being monitored. With `MONITOR_PROJECT` set, every service
  * container of that compose project, rediscovered before each poll so added
@@ -141,16 +147,18 @@ let refreshing = null;
 function refreshTargets() {
     if (!MONITOR_PROJECT)
         return Promise.resolve();
-    refreshing ??= discoverTargets().finally(() => {
-        refreshing = null;
-    });
+    if (!refreshing) {
+        refreshing = discoverTargets().finally(() => {
+            refreshing = null;
+        });
+    }
     return refreshing;
 }
 async function discoverTargets() {
     // `all` keeps stopped and crashed containers in the set until they are removed.
     const filters = encodeURIComponent(JSON.stringify({ label: [`${PROJECT_LABEL}=${MONITOR_PROJECT}`] }));
     try {
-        const { status, body } = await dockerRequest("GET", `/containers/json?all=true&filters=${filters}`);
+        const { status, body } = await dockerRequest("GET", `/containers/json?all=true&filters=${filters}`, DISCOVERY_TIMEOUT_MS);
         if (status !== 200 || !Array.isArray(body)) {
             console.warn(`[targets] container list failed (${status}); keeping ${targets.length} known targets`);
             return;
