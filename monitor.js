@@ -28,6 +28,7 @@ const fs_1 = require("fs");
 // ---------------------------------------------------------------------------
 const DISCORD_WEBHOOK = process.env.DISCORD_ALARM_WEBHOOK ?? "";
 const LOG_SERVER_TOKEN = process.env.LOG_SERVER_TOKEN ?? "";
+const MONITOR_PROJECT = (process.env.MONITOR_PROJECT ?? "").trim();
 const MONITOR_TARGETS = (process.env.MONITOR_TARGETS ?? "")
     .split(",")
     .map((s) => s.trim())
@@ -120,6 +121,52 @@ function dockerStream(path) {
     });
 }
 // ---------------------------------------------------------------------------
+// Targets
+// ---------------------------------------------------------------------------
+const PROJECT_LABEL = "com.docker.compose.project";
+const ONEOFF_LABEL = "com.docker.compose.oneoff";
+/**
+ * Containers being monitored. With `MONITOR_PROJECT` set, every service
+ * container of that compose project, rediscovered before each poll so added
+ * and removed services are picked up without a restart; otherwise the fixed
+ * `MONITOR_TARGETS` list.
+ */
+let targets = MONITOR_PROJECT ? [] : MONITOR_TARGETS;
+function isProjectService(labels) {
+    return labels?.[PROJECT_LABEL] === MONITOR_PROJECT && labels?.[ONEOFF_LABEL] !== "True";
+}
+async function refreshTargets() {
+    if (!MONITOR_PROJECT)
+        return;
+    // `all` keeps stopped and crashed containers in the set until they are removed.
+    const filters = encodeURIComponent(JSON.stringify({ label: [`${PROJECT_LABEL}=${MONITOR_PROJECT}`] }));
+    try {
+        const { status, body } = await dockerRequest("GET", `/containers/json?all=true&filters=${filters}`);
+        if (status !== 200 || !Array.isArray(body)) {
+            console.warn(`[targets] container list failed (${status}); keeping ${targets.length} known targets`);
+            return;
+        }
+        const next = body
+            .filter((c) => isProjectService(c.Labels))
+            .map((c) => (c.Names?.[0] ?? "").replace(/^\//, ""))
+            .filter(Boolean)
+            .sort();
+        if (next.join(",") !== targets.join(",")) {
+            console.log(`[targets] ${next.join(", ") || "(none)"}`);
+            for (const name of targets) {
+                if (next.includes(name))
+                    continue;
+                for (const state of [healthState, healthFailCount, crashedAt, statsHistory, pressureCount])
+                    delete state[name];
+            }
+            targets = next;
+        }
+    }
+    catch (e) {
+        console.warn("[targets] container list failed:", e instanceof Error ? e.message : String(e));
+    }
+}
+// ---------------------------------------------------------------------------
 // Docker log framing (shared utility)
 // ---------------------------------------------------------------------------
 // ---------------------------------------------------------------------------
@@ -190,7 +237,8 @@ function isBackAfterCrash(name, state, health) {
     return health === "none" && Date.now() - startedAt >= HEALTH_POLL_INTERVAL_MS;
 }
 async function pollHealth() {
-    for (const name of MONITOR_TARGETS) {
+    await refreshTargets();
+    for (const name of targets) {
         try {
             const { status, body } = await dockerRequest("GET", `/containers/${name}/json`);
             if (status !== 200) {
@@ -308,7 +356,8 @@ function calcWorkingSetBytes(mem) {
     return usage;
 }
 async function pollStats() {
-    for (const name of MONITOR_TARGETS) {
+    await refreshTargets();
+    for (const name of targets) {
         try {
             const { status, body } = await dockerRequest("GET", `/containers/${name}/stats?stream=false`);
             if (status !== 200)
@@ -481,7 +530,10 @@ async function watchEvents() {
                     // "die" carries the real exit code; "kill" fires before the process exits
                     // and always lacks an exit code — using it caused false alarms on deployments.
                     // "oom" has no exit code but always signals a real crash (kernel OOM kill).
-                    if (!MONITOR_TARGETS.includes(name))
+                    const monitored = MONITOR_PROJECT
+                        ? isProjectService(event.Actor?.Attributes)
+                        : MONITOR_TARGETS.includes(name);
+                    if (!monitored)
                         continue;
                     if (action === "oom") {
                         console.error(`[events] ${name}: OOM kill`);
@@ -578,7 +630,7 @@ async function handleRequest(req, res) {
     if (pathname === "/health") {
         sendJson(res, 200, {
             status: "ok",
-            targets: MONITOR_TARGETS,
+            targets,
             health: healthState,
             uptime: process.uptime(),
         });
@@ -607,12 +659,12 @@ async function handleRequest(req, res) {
         }
         return;
     }
-    // GET /stats/:container — restricted to MONITOR_TARGETS
+    // GET /stats/:container — restricted to monitored containers
     const statsMatch = /^\/stats\/([^/]+)$/.exec(pathname);
     if (statsMatch && req.method === "GET") {
         const container = statsMatch[1] ?? "";
-        if (!MONITOR_TARGETS.includes(container)) {
-            sendJson(res, 403, { error: "Container not in MONITOR_TARGETS" });
+        if (!targets.includes(container)) {
+            sendJson(res, 403, { error: "Container not monitored" });
             return;
         }
         const ring = statsHistory[container] ?? [];
@@ -626,12 +678,12 @@ async function handleRequest(req, res) {
         });
         return;
     }
-    // GET /logs/:container — restricted to MONITOR_TARGETS
+    // GET /logs/:container — restricted to monitored containers
     const logsMatch = /^\/logs\/([^/]+)$/.exec(pathname);
     if (logsMatch && req.method === "GET") {
         const container = logsMatch[1] ?? "";
-        if (!MONITOR_TARGETS.includes(container)) {
-            sendJson(res, 403, { error: "Container not in MONITOR_TARGETS" });
+        if (!targets.includes(container)) {
+            sendJson(res, 403, { error: "Container not monitored" });
             return;
         }
         // Validate `tail`: unbounded / non-numeric / negative values used to
@@ -711,7 +763,9 @@ async function handleRequest(req, res) {
 // ---------------------------------------------------------------------------
 server.listen(LOG_PORT, () => {
     console.log(`[monitor] Log server listening on port ${LOG_PORT}`);
-    console.log(`[monitor] Targets: ${MONITOR_TARGETS.join(", ") || "(none)"}`);
+    console.log(MONITOR_PROJECT
+        ? `[monitor] Targets: services of compose project "${MONITOR_PROJECT}"`
+        : `[monitor] Targets: ${MONITOR_TARGETS.join(", ") || "(none)"}`);
     console.log(`[monitor] Health poll interval: ${HEALTH_POLL_INTERVAL_MS}ms`);
     console.log(`[monitor] Stats poll interval: ${STATS_POLL_INTERVAL_MS}ms · history=${STATS_HISTORY_SIZE} · pressure=${MEMORY_PRESSURE_RATIO}×${MEMORY_PRESSURE_SUSTAINED}`);
     if (!DISCORD_WEBHOOK)
