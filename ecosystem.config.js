@@ -10,9 +10,10 @@ module.exports = {
       max_memory_restart: "100M",
       env: {
         NODE_ENV: "production",
-        // Required
+        // Required, plus one of MONITOR_PROJECT or MONITOR_TARGETS
         DISCORD_ALARM_WEBHOOK: process.env.DISCORD_ALARM_WEBHOOK,
         LOG_SERVER_TOKEN: process.env.LOG_SERVER_TOKEN,
+        MONITOR_PROJECT: process.env.MONITOR_PROJECT,
         MONITOR_TARGETS: process.env.MONITOR_TARGETS,
         // Optional (defaults shown)
         LOG_PORT: process.env.LOG_PORT || "9000",

@@ -12,7 +12,7 @@ Single-file prod monitor managed by pm2. Five responsibilities in one process:
 
 ```bash
 cp .env.example .env
-# edit .env — set DISCORD_ALARM_WEBHOOK, LOG_SERVER_TOKEN, MONITOR_TARGETS
+# edit .env — set DISCORD_ALARM_WEBHOOK, LOG_SERVER_TOKEN, MONITOR_PROJECT
 
 pm2 start ecosystem.config.js
 pm2 save
@@ -65,7 +65,8 @@ Stats are polled from the Docker socket (`/containers/{name}/stats?stream=false`
 |---|---|---|---|
 | `DISCORD_ALARM_WEBHOOK` | yes | — | Discord webhook URL |
 | `LOG_SERVER_TOKEN` | yes | — | Bearer token for log API |
-| `MONITOR_TARGETS` | yes | — | Comma-separated container names |
+| `MONITOR_PROJECT` | one of these two | — | Compose project name; every service container of the project is monitored, rediscovered before each poll (one-off `compose run` containers excluded) |
+| `MONITOR_TARGETS` | one of these two | — | Comma-separated container names; ignored when `MONITOR_PROJECT` is set |
 | `LOG_PORT` | no | `9000` | Log server port |
 | `HEALTH_POLL_INTERVAL_MS` | no | `60000` | Health poll interval |
 | `HEALTH_FAIL_THRESHOLD` | no | `1` | Failures before alarm |
