@@ -70,7 +70,7 @@ The token itself is never stored in the browser: the page sends it once in the l
 
 ## Building
 
-Write code in `src/monitor.ts`, then compile it to `monitor.js` and commit both. `monitor.js` is the only thing pm2 runs — there is no build step on the server; deploy is `git pull` + `pm2 restart monitor`. `frontend.html` ships in the repo next to `monitor.js` and is read from disk per request, so a pull updates the dashboard with no restart.
+Write code in `src/monitor.ts`, then compile it to `monitor.js` and commit both. `monitor.js` is the only thing pm2 runs — there is no build step on the server; deploy is `git pull` + `pm2 restart ecosystem.config.js` (restarting by config file re-reads it, so env/config changes take effect; `pm2 restart monitor` alone would restart with the previously loaded config). `frontend.html` ships in the repo next to `monitor.js` and is read from disk per request, so a pull updates the dashboard with no restart.
 
 ```bash
 # TypeScript and the Node type declarations are build-time tools only
