@@ -6,6 +6,9 @@
  *   2. Healthcheck polling — Docker socket, GET /containers/{name}/json every 60s
  *   3. Docker event capture — die/oom events via Docker socket event stream (kill events ignored)
  *   4. Log server — read-only HTTP API backed by systemd-journald
+ *   5. Frontend — static dashboard (`frontend.html`) served at `/`, with
+ *      cookie login: POST /login exchanges LOG_SERVER_TOKEN for a session
+ *      cookie (1-day sliding expiry, refreshed on every transaction).
  *
  * All four run in one process, managed by pm2 on the host.
  *
@@ -19,6 +22,8 @@ import http from "http";
 import https from "https";
 import { spawn } from "child_process";
 import { readFileSync } from "fs";
+import { randomBytes, timingSafeEqual } from "crypto";
+import { join } from "path";
 
 // ---------------------------------------------------------------------------
 // Config
@@ -762,6 +767,130 @@ async function watchEvents(): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------
+// Frontend + cookie login
+// ---------------------------------------------------------------------------
+//
+// The dashboard is a static file (`frontend.html`, shipped in the repo
+// next to the compiled `monitor.js` and read from disk per request, so a
+// `git pull` updates it with no restart and no second process). It calls
+// the same API routes below — the browser just authenticates with a
+// cookie instead of a token:
+//
+//   POST /login { token } — the token is the existing LOG_SERVER_TOKEN.
+//     On match, the server mints a random session id, stores it with a
+//     1-day expiry, and sets it as an HttpOnly cookie.
+//   Cookie auth — every request carrying a valid session cookie is
+//     authenticated, and the cookie is re-issued with a fresh 1-day
+//     expiry on every such transaction (sliding expiry: the session
+//     only lapses after a full day with no requests).
+//   POST /logout — drops the session server-side and clears the cookie.
+//
+// Bearer auth is unchanged: API clients keep working exactly as before,
+// and a request may authenticate by either method. The token itself
+// never goes into a cookie or localStorage — the page sends it once,
+// in the login POST body, and the browser then only presents the
+// opaque session id.
+
+const SESSION_COOKIE_NAME = "monitor_session";
+const SESSION_TTL_MS = 24 * 60 * 60 * 1000; // 1 day
+const SESSION_COOKIE_MAX_AGE = 86_400; // seconds, matches SESSION_TTL_MS
+
+/** Session id -> expiry (epoch ms). Swept hourly; see `sweepSessions`. */
+const sessions = new Map<string, number>();
+
+function sessionCookieHeader(sessionId: string): string {
+  return `${SESSION_COOKIE_NAME}=${sessionId}; Max-Age=${SESSION_COOKIE_MAX_AGE}; Path=/; HttpOnly; SameSite=Lax`;
+}
+
+function clearSessionCookieHeader(): string {
+  return `${SESSION_COOKIE_NAME}=; Max-Age=0; Path=/; HttpOnly; SameSite=Lax`;
+}
+
+function parseCookies(req: http.IncomingMessage): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const part of (req.headers.cookie ?? "").split(";")) {
+    const eq = part.indexOf("=");
+    if (eq === -1) continue;
+    const name = part.slice(0, eq).trim();
+    if (name) out[name] = part.slice(eq + 1).trim();
+  }
+  return out;
+}
+
+/** True when the session exists and has not expired (expired ids are dropped). */
+function hasValidSession(sessionId: string): boolean {
+  const expiresAt = sessions.get(sessionId);
+  if (expiresAt === undefined) return false;
+  if (expiresAt <= Date.now()) {
+    sessions.delete(sessionId);
+    return false;
+  }
+  return true;
+}
+
+/**
+ * Validate the request's session cookie and, when valid, slide its expiry
+ * to a fresh 1 day and re-issue the cookie on this response. Returns
+ * false when there is no session cookie or it is missing/expired.
+ * Must run before the response headers are written — it sets the
+ * cookie via `setHeader`, which `writeHead` merges with its own headers.
+ */
+function refreshSession(req: http.IncomingMessage, res: http.ServerResponse): boolean {
+  const sessionId = parseCookies(req)[SESSION_COOKIE_NAME];
+  if (!sessionId || !hasValidSession(sessionId)) return false;
+  sessions.set(sessionId, Date.now() + SESSION_TTL_MS);
+  res.setHeader("Set-Cookie", sessionCookieHeader(sessionId));
+  return true;
+}
+
+/** Drop sessions past expiry so the map can't grow without bound. */
+function sweepSessions(): void {
+  const now = Date.now();
+  for (const [id, expiresAt] of sessions) {
+    if (expiresAt <= now) sessions.delete(id);
+  }
+}
+
+/** Constant-time token comparison for the login route (lengths may differ). */
+function tokensEqual(a: string, b: string): boolean {
+  const ab = Buffer.from(a);
+  const bb = Buffer.from(b);
+  if (ab.length !== bb.length) return false;
+  return timingSafeEqual(ab, bb);
+}
+
+/** Read the request body, capped so a login POST can't stream unboundedly. */
+function readBody(req: http.IncomingMessage, maxBytes = 10_000): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    let size = 0;
+    req.on("data", (chunk: Buffer) => {
+      size += chunk.length;
+      if (size > maxBytes) {
+        req.destroy();
+        reject(new Error("Body too large"));
+        return;
+      }
+      chunks.push(chunk);
+    });
+    req.on("end", () => resolve(Buffer.concat(chunks).toString()));
+    req.on("error", reject);
+  });
+}
+
+/** The static dashboard file, resolved next to the running script first. */
+function readFrontendHtml(): string | null {
+  for (const candidate of [join(__dirname, "frontend.html"), join(__dirname, "..", "frontend.html")]) {
+    try {
+      return readFileSync(candidate, "utf-8");
+    } catch {
+      // try the next candidate
+    }
+  }
+  return null;
+}
+
+// ---------------------------------------------------------------------------
 // Log server (#4)
 // ---------------------------------------------------------------------------
 
@@ -820,6 +949,9 @@ async function handleRequest(
   // need a public endpoint. README documents this row as "no auth"; a
   // Bearer gate here would silent-401 the probes.
   if (pathname === "/health") {
+    // A logged-in browser hitting /health keeps its session sliding too;
+    // orchestrator probes carry no cookie, so this is a no-op for them.
+    refreshSession(req, res);
     sendJson(res, 200, {
       status: "ok",
       targets,
@@ -829,7 +961,57 @@ async function handleRequest(
     return;
   }
 
-  if (!isAuthenticated(req)) {
+  // Static frontend — public by design: the page itself carries no data,
+  // and every data call it makes goes through the auth gate below.
+  if ((pathname === "/" || pathname === "/frontend.html") && req.method === "GET") {
+    refreshSession(req, res);
+    const html = readFrontendHtml();
+    if (html === null) {
+      sendJson(res, 500, { error: "Frontend not found" });
+      return;
+    }
+    res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+    res.end(html);
+    return;
+  }
+
+  // POST /login — exchange the existing token for a session cookie.
+  if (pathname === "/login" && req.method === "POST") {
+    let body: string;
+    try {
+      body = await readBody(req);
+    } catch {
+      sendJson(res, 400, { error: "Bad request" });
+      return;
+    }
+    let token: unknown;
+    try {
+      token = (JSON.parse(body) as { token?: unknown }).token;
+    } catch {
+      sendJson(res, 400, { error: "Bad request" });
+      return;
+    }
+    if (typeof token !== "string" || !LOG_SERVER_TOKEN || !tokensEqual(token, LOG_SERVER_TOKEN)) {
+      sendJson(res, 401, { error: "Unauthorized" });
+      return;
+    }
+    const sessionId = randomBytes(32).toString("base64url");
+    sessions.set(sessionId, Date.now() + SESSION_TTL_MS);
+    res.setHeader("Set-Cookie", sessionCookieHeader(sessionId));
+    sendJson(res, 200, { ok: true });
+    return;
+  }
+
+  // POST /logout — drop the session and clear the cookie.
+  if (pathname === "/logout" && req.method === "POST") {
+    const sessionId = parseCookies(req)[SESSION_COOKIE_NAME];
+    if (sessionId) sessions.delete(sessionId);
+    res.setHeader("Set-Cookie", clearSessionCookieHeader());
+    sendJson(res, 200, { ok: true });
+    return;
+  }
+
+  if (!isAuthenticated(req) && !refreshSession(req, res)) {
     sendJson(res, 401, { error: "Unauthorized" });
     return;
   }
@@ -981,4 +1163,5 @@ setInterval(() => void pollHealth(), HEALTH_POLL_INTERVAL_MS);
 void pollHealth(); // immediate first check
 setInterval(() => void pollStats(), STATS_POLL_INTERVAL_MS);
 void pollStats(); // immediate first sample
+setInterval(sweepSessions, 60 * 60 * 1000); // drop expired login sessions
 void watchEvents();

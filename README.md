@@ -1,12 +1,13 @@
 # monitor
 
-Single-file prod monitor managed by pm2. Five responsibilities in one process:
+Single-file prod monitor managed by pm2. Six responsibilities in one process:
 
 1. **Discord alarm** — webhook on crash, health failure, or recovery
 2. **Healthcheck polling** — Docker socket `/containers/{name}/json` every 60s
 3. **Docker event capture** — `die`/`kill`/`oom` events via Docker event stream
 4. **Log server** — read-only HTTP API backed by `journalctl` (systemd-journald)
 5. **Docker stats polling** — memory + CPU sampled from Docker socket every 20s; `MEMORY_PRESSURE` early-warning alarm before OOM
+6. **Frontend** — static dashboard (`frontend.html`) served at `/`, with cookie login (see below)
 
 ## Setup
 
@@ -50,12 +51,38 @@ The user running monitor (via pm2) needs read access to the journal — either r
 | Endpoint | Auth | Description |
 |---|---|---|
 | `GET /health` | none | Server health + monitored container states |
-| `GET /containers` | Bearer token | List running containers |
-| `GET /logs/:container` | Bearer token | Last 100 log lines |
-| `GET /logs/:container?tail=500` | Bearer token | Configurable tail |
-| `GET /stats/:container` | Bearer token | Current + up-to-hour ring buffer of Docker stats (memory usage, working set, anon/file/inactive-file breakdown, memory limit, usage ratio (working set / limit), CPU %) |
+| `GET /` | none | Static frontend dashboard (`frontend.html`); the page itself carries no data |
+| `GET /frontend.html` | none | Same dashboard file, direct path |
+| `POST /login` | token in body | Exchange `LOG_SERVER_TOKEN` for a session cookie (see Frontend) |
+| `POST /logout` | session cookie | Drop the session and clear the cookie |
+| `GET /containers` | Bearer token or session cookie | List running containers |
+| `GET /logs/:container` | Bearer token or session cookie | Last 100 log lines |
+| `GET /logs/:container?tail=500` | Bearer token or session cookie | Configurable tail |
+| `GET /stats/:container` | Bearer token or session cookie | Current + up-to-hour ring buffer of Docker stats (memory usage, working set, anon/file/inactive-file breakdown, memory limit, usage ratio (working set / limit), CPU %) |
 
-Auth: `Authorization: Bearer $LOG_SERVER_TOKEN`
+Auth: `Authorization: Bearer $LOG_SERVER_TOKEN`, or the session cookie set by `POST /login`.
+
+## Frontend
+
+Open `/` in a browser. Log in with the existing `LOG_SERVER_TOKEN` — the same token the API accepts as a Bearer token. On success the server sets an `HttpOnly` session cookie (`monitor_session`) valid for 1 day, refreshed to a fresh 1 day on every authenticated request (sliding expiry: the session only lapses after a full day with no requests). The dashboard then shows running containers with health states, per-container memory/CPU stats, and log tails (configurable tail + optional `since` window, same parameters as the API), auto-refreshing every 30s. Log out with the button in the header.
+
+The token itself is never stored in the browser: the page sends it once in the login POST body, and afterwards the browser only presents the opaque session id. API clients are unaffected — Bearer auth keeps working exactly as before.
+
+## Building
+
+Write code in `src/monitor.ts`, then compile it to `monitor.js` and commit both. `monitor.js` is the only thing pm2 runs — there is no build step on the server; deploy is `git pull` + `pm2 restart monitor`. `frontend.html` ships in the repo next to `monitor.js` and is read from disk per request, so a pull updates the dashboard with no restart.
+
+```bash
+# TypeScript and the Node type declarations are build-time tools only
+# (never committed, never installed on the server). Install once:
+npm install -g typescript @types/node
+
+# Then, from the repo root:
+tsc src/monitor.ts --outDir /tmp/monitor-out --module commonjs --target es2022 --esModuleInterop --skipLibCheck --typeRoots "$(npm root -g)/@types"
+cp /tmp/monitor-out/monitor.js ./monitor.js
+```
+
+Never edit `monitor.js` by hand — it is generated output.
 
 Stats are polled from the Docker socket (`/containers/{name}/stats?stream=false`), so they reflect cgroup-derived memory + CPU exactly the way `docker stats` does. Memory pressure is measured on the working set — `memory_stats.usage` minus inactive file cache (`inactive_file` on cgroup v2, `total_inactive_file` on v1), the figure `docker stats` shows as MEM USAGE — because the kernel reclaims that cache before it OOM-kills. A `MEMORY_PRESSURE` alarm fires to Discord when a container's working set / `memory_stats.limit` stays above `MEMORY_PRESSURE_RATIO` for `MEMORY_PRESSURE_SUSTAINED` consecutive samples — early warning before the kernel OOM-kills the container. Only fires when the container has an explicit `--memory` / `mem_limit` set (no explicit limit → the "limit" Docker reports is host RAM, making the ratio uninformative).
 
