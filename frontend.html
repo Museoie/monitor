@@ -29,6 +29,16 @@
   dd { margin: 0; word-break: break-all; }
   pre { background: #000; border: 1px solid #333; border-radius: 8px; padding: 0.7rem; overflow: auto; max-height: 60vh; white-space: pre-wrap; word-break: break-word; font-size: 0.85rem; }
   .muted { color: #999; font-size: 0.85rem; }
+  .charts { display: grid; grid-template-columns: 1fr 1fr; gap: 0.7rem; margin: 0.5rem 0; }
+  .chart { background: #1c1c1c; border: 1px solid #333; border-radius: 8px; padding: 0.7rem; }
+  .chart h4 { margin: 0 0 0.4rem; font-size: 0.95rem; }
+  .chart canvas { width: 100%; height: 140px; display: block; }
+  .chart .legend { color: #bbb; font-size: 0.8rem; margin-top: 0.3rem; }
+  @media (max-width: 640px) {
+    .charts { grid-template-columns: 1fr; }
+    .cards { display: flex; flex-wrap: nowrap; overflow-x: auto; scroll-snap-type: x proximity; padding-bottom: 0.4rem; -webkit-overflow-scrolling: touch; }
+    .cards .card { flex: 0 0 76%; scroll-snap-align: start; }
+  }
 </style>
 </head>
 <body>
@@ -61,6 +71,18 @@
     <h3>Stats</h3>
     <dl id="stats"></dl>
     <p id="statsStatus" class="muted"></p>
+    <div class="charts">
+      <div class="chart">
+        <h4>CPU %</h4>
+        <canvas id="cpuChart" height="140"></canvas>
+        <div id="cpuLegend" class="legend"></div>
+      </div>
+      <div class="chart">
+        <h4>Memory (working set)</h4>
+        <canvas id="memChart" height="140"></canvas>
+        <div id="memLegend" class="legend"></div>
+      </div>
+    </div>
     <h3>Logs</h3>
     <div class="row">
       <label>Tail
@@ -90,9 +112,12 @@ const detailView = $("detailView"), detailTitle = $("detailTitle");
 const statsEl = $("stats"), statsStatus = $("statsStatus");
 const logsEl = $("logs"), logsStatus = $("logsStatus");
 const tailSelect = $("tailSelect"), sinceInput = $("sinceInput");
+const cpuChart = $("cpuChart"), memChart = $("memChart");
+const cpuLegend = $("cpuLegend"), memLegend = $("memLegend");
 
 let selected = null;
 let autoTimer = null;
+let lastStats = null;
 
 function showLogin() {
   loginView.hidden = false;
@@ -181,6 +206,131 @@ async function loadContainers() {
   }
 }
 
+// History charts: plain canvas, no dependencies. Samples arrive evenly
+// spaced (one per poll), so x is the sample index and nulls leave gaps.
+function drawChart(canvas, values, opts) {
+  const ctx = canvas.getContext("2d");
+  const dpr = window.devicePixelRatio || 1;
+  const w = canvas.clientWidth;
+  const h = canvas.clientHeight || 140;
+  if (w <= 0) return;
+  canvas.width = Math.round(w * dpr);
+  canvas.height = Math.round(h * dpr);
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, w, h);
+  const padL = 46, padR = 8, padT = 8, padB = 18;
+  const plotW = w - padL - padR, plotH = h - padT - padB;
+  const nums = values.filter((v) => v !== null && v !== undefined);
+  if (nums.length < 2) return;
+  let ymax = Math.max(...nums, opts.limit || 0);
+  if (ymax <= 0) ymax = 1;
+  ymax *= 1.1;
+  const x = (i) => padL + (i / (values.length - 1)) * plotW;
+  const y = (v) => padT + plotH - (v / ymax) * plotH;
+  ctx.strokeStyle = "#333";
+  ctx.fillStyle = "#999";
+  ctx.font = "10px system-ui, sans-serif";
+  ctx.lineWidth = 1;
+  for (const frac of [0, 0.5, 1]) {
+    const gy = padT + plotH - frac * plotH;
+    ctx.beginPath();
+    ctx.moveTo(padL, gy);
+    ctx.lineTo(w - padR, gy);
+    ctx.stroke();
+    ctx.fillText(opts.format(ymax * frac), 2, gy + 3);
+  }
+  if (opts.t0) ctx.fillText(opts.t0, padL, h - 5);
+  if (opts.t1) {
+    const tw = ctx.measureText(opts.t1).width;
+    ctx.fillText(opts.t1, w - padR - tw, h - 5);
+  }
+  if (opts.limit) {
+    ctx.strokeStyle = "#ff8080";
+    ctx.setLineDash([5, 4]);
+    ctx.beginPath();
+    ctx.moveTo(padL, y(opts.limit));
+    ctx.lineTo(w - padR, y(opts.limit));
+    ctx.stroke();
+    ctx.setLineDash([]);
+  }
+  const runs = [];
+  let run = [];
+  for (let i = 0; i < values.length; i++) {
+    const v = values[i];
+    if (v === null || v === undefined) {
+      if (run.length) runs.push(run);
+      run = [];
+    } else {
+      run.push([x(i), y(v)]);
+    }
+  }
+  if (run.length) runs.push(run);
+  ctx.strokeStyle = opts.color;
+  ctx.lineWidth = 1.5;
+  ctx.beginPath();
+  for (const r of runs) {
+    ctx.moveTo(r[0][0], r[0][1]);
+    for (let j = 1; j < r.length; j++) ctx.lineTo(r[j][0], r[j][1]);
+  }
+  ctx.stroke();
+  ctx.globalAlpha = 0.15;
+  ctx.fillStyle = opts.color;
+  for (const r of runs) {
+    ctx.beginPath();
+    ctx.moveTo(r[0][0], padT + plotH);
+    for (const [px, py] of r) ctx.lineTo(px, py);
+    ctx.lineTo(r[r.length - 1][0], padT + plotH);
+    ctx.closePath();
+    ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+}
+
+function clearCharts() {
+  for (const [canvas, legend] of [[cpuChart, cpuLegend], [memChart, memLegend]]) {
+    canvas.getContext("2d").clearRect(0, 0, canvas.width, canvas.height);
+    legend.textContent = "";
+  }
+}
+
+function drawCharts() {
+  if (!lastStats || !selected || detailView.hidden) return;
+  const history = lastStats.history || [];
+  const spanMs = history.length > 1 ? (history.length - 1) * (lastStats.poll_interval_ms || 60000) : 0;
+  const span = spanMs ? ` · last ~${Math.max(1, Math.round(spanMs / 60000))} min` : "";
+  const fmtTime = (ts) => {
+    const d = new Date(ts);
+    return isNaN(d) ? "" : d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  };
+  const t0 = history.length ? fmtTime(history[0].ts) : "";
+  const t1 = history.length ? fmtTime(history[history.length - 1].ts) : "";
+  const cpuVals = history.map((s) => s.cpu_percent);
+  const cpuNums = cpuVals.filter((v) => v !== null && v !== undefined);
+  if (cpuNums.length < 2) {
+    cpuLegend.textContent = "Not enough samples yet.";
+    cpuChart.getContext("2d").clearRect(0, 0, cpuChart.width, cpuChart.height);
+  } else {
+    cpuLegend.textContent = `last ${cpuNums[cpuNums.length - 1].toFixed(1)}% · max ${Math.max(...cpuNums).toFixed(1)}% · ${history.length} samples${span}`;
+    drawChart(cpuChart, cpuVals, { color: "#6aa9ff", format: (v) => v.toFixed(0) + "%", t0, t1 });
+  }
+  const memVals = history.map((s) => s.working_set_bytes);
+  const latest = lastStats.latest;
+  const capped = latest && latest.usage_ratio !== null && latest.limit_bytes ? latest.limit_bytes : null;
+  if (memVals.length < 2) {
+    memLegend.textContent = "Not enough samples yet.";
+    memChart.getContext("2d").clearRect(0, 0, memChart.width, memChart.height);
+  } else {
+    memLegend.textContent = `last ${fmtBytes(memVals[memVals.length - 1])} · max ${fmtBytes(Math.max(...memVals))}${capped ? ` · limit ${fmtBytes(capped)}` : ""} · ${history.length} samples${span}`;
+    drawChart(memChart, memVals, { color: "#7ddc7d", format: fmtBytes, limit: capped, t0, t1 });
+  }
+}
+
+let resizeTimer = null;
+window.addEventListener("resize", () => {
+  if (resizeTimer !== null) clearTimeout(resizeTimer);
+  resizeTimer = setTimeout(drawCharts, 150);
+});
+
 async function loadStats() {
   if (!selected) return;
   statsStatus.textContent = "Loading…";
@@ -202,6 +352,8 @@ async function loadStats() {
       statsEl.appendChild(text("dd", v));
     }
     statsStatus.textContent = `Poll interval ${data.poll_interval_ms}ms · pressure threshold ${Math.round((data.pressure_threshold_ratio || 0) * 100)}%`;
+    lastStats = data;
+    drawCharts();
   } catch (e) {
     if (e.message !== "Unauthorized") statsStatus.textContent = `Failed to load stats: ${e.message}`;
   }
@@ -226,6 +378,8 @@ function selectContainer(name) {
   selected = name;
   detailTitle.textContent = name;
   detailView.hidden = false;
+  lastStats = null;
+  clearCharts();
   document.querySelectorAll(".card").forEach((card) => {
     card.classList.toggle("selected", card.querySelector(".name").textContent === name);
   });

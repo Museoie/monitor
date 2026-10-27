@@ -64,7 +64,7 @@ Auth: `Authorization: Bearer $LOG_SERVER_TOKEN`, or the session cookie set by `P
 
 ## Frontend
 
-Open `/` in a browser. Log in with the existing `LOG_SERVER_TOKEN` — the same token the API accepts as a Bearer token. On success the server sets an `HttpOnly` session cookie (`monitor_session`) valid for 1 day, refreshed to a fresh 1 day on every authenticated request (sliding expiry: the session only lapses after a full day with no requests). The dashboard then shows running containers with health states, per-container memory/CPU stats, and log tails (configurable tail + optional `since` window, same parameters as the API), auto-refreshing every 30s. Log out with the button in the header.
+Open `/` in a browser. Log in with the existing `LOG_SERVER_TOKEN` — the same token the API accepts as a Bearer token. On success the server sets an `HttpOnly` session cookie (`monitor_session`) valid for 1 day, refreshed to a fresh 1 day on every authenticated request (sliding expiry: the session only lapses after a full day with no requests). The dashboard then shows running containers with health states, per-container memory/CPU stats with CPU and memory history graphs, and log tails (configurable tail + optional `since` window, same parameters as the API), auto-refreshing every 30s. Log out with the button in the header.
 
 The token itself is never stored in the browser: the page sends it once in the login POST body, and afterwards the browser only presents the opaque session id. API clients are unaffected — Bearer auth keeps working exactly as before.
 
