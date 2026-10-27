@@ -21,9 +21,10 @@
 import http from "http";
 import https from "https";
 import { spawn } from "child_process";
-import { readFileSync } from "fs";
+import { appendFileSync, existsSync, mkdirSync, readFile, readFileSync, readdirSync, unlink, unlinkSync, writeFile } from "fs";
 import { randomBytes, timingSafeEqual } from "crypto";
-import { join } from "path";
+import { dirname, isAbsolute, join } from "path";
+import { gzip, gunzipSync } from "zlib";
 
 // ---------------------------------------------------------------------------
 // Config
@@ -48,13 +49,27 @@ const ALARM_COOLDOWN_MS = parseInt(process.env.ALARM_COOLDOWN_MS ?? "60000", 10)
 const LOG_PORT = parseInt(process.env.LOG_PORT ?? "9000", 10);
 const DOCKER_SOCKET = process.env.DOCKER_SOCKET ?? "/var/run/docker.sock";
 const JOURNALCTL_BIN = process.env.JOURNALCTL_BIN ?? "journalctl";
-// Tightened default to 20s (was 60s). Typical OOM lead time from
-// 85%→kill is 10-60s under sustained load; a 3× minute poll cadence
-// often missed the pre-death signal the alarm exists to catch.
-const STATS_POLL_INTERVAL_MS = parseIntEnv("STATS_POLL_INTERVAL_MS", 20_000);
-const STATS_HISTORY_SIZE = parseIntEnv("STATS_HISTORY_SIZE", 60);
+// 1s base cadence feeding tiered retention (see the stats section): the
+// finest tier is 1-second samples, so the poll must run at 1s. The 20s
+// default it replaces often missed the pre-death signal the pressure
+// alarm exists to catch (typical OOM lead time from 85%→kill is 10-60s).
+const STATS_POLL_INTERVAL_MS = parseIntEnv("STATS_POLL_INTERVAL_MS", 1_000);
 const MEMORY_PRESSURE_RATIO = parseFloatEnv("MEMORY_PRESSURE_RATIO", 0.85);
-const MEMORY_PRESSURE_SUSTAINED = parseIntEnv("MEMORY_PRESSURE_SUSTAINED", 3);
+// Wall-clock sustained time before the pressure alarm fires (was a poll
+// count — 3 polls meant 3 minutes at the old 60s cadence, but 3 seconds
+// at 1s polling). 180s preserves the old effective behavior.
+const MEMORY_PRESSURE_SUSTAINED_MS = parseIntEnv("MEMORY_PRESSURE_SUSTAINED_MS", 180_000);
+// Stats store root: raw 1s segments + per-tier rollup segments, all
+// append-only files under one directory (resolved next to the running
+// script, like the frontend file). Pruned per tier (see STATS_TIERS).
+const STATS_DATA_DIR = (() => {
+  const raw = process.env.STATS_DATA_DIR?.trim();
+  if (!raw) return join(__dirname, "stats-data");
+  return isAbsolute(raw) ? raw : join(__dirname, raw);
+})();
+// Raw 1-second retention in days (rollup tiers keep their own, longer
+// retentions in STATS_TIERS). 30 days ≈ 370 MiB gzipped for 7 containers.
+const STATS_RAW_RETENTION_DAYS = parseIntEnv("STATS_RAW_RETENTION_DAYS", 30);
 const JOURNALCTL_TIMEOUT_MS = parseIntEnv("JOURNALCTL_TIMEOUT_MS", 15_000);
 
 // Host RAM ceiling. Docker reports `memory_stats.limit` as host total
@@ -215,7 +230,7 @@ async function discoverTargets(): Promise<void> {
     else console.warn(`[targets] no containers in compose project "${MONITOR_PROJECT}"`);
     for (const name of targets) {
       if (next.includes(name)) continue;
-      for (const state of [healthState, healthFailCount, crashedAt, statsHistory, pressureCount]) delete state[name];
+      for (const state of [healthState, healthFailCount, crashedAt, openBuckets, pressureSince, latestSample]) delete state[name];
     }
     targets = next;
   } catch (e: unknown) {
@@ -421,6 +436,8 @@ interface StatsSample {
   limit_bytes: number | null;
   usage_ratio: number | null;
   cpu_percent: number | null;
+  /** Aggregation window that produced this point (1s for raw samples). */
+  resolution_ms: number;
 }
 
 interface DockerStatsResponse {
@@ -441,8 +458,612 @@ interface DockerStatsResponse {
   };
 }
 
-const statsHistory: Record<string, StatsSample[]> = {};
-const pressureCount: Record<string, number> = {};
+/**
+ * Cascading rollups: every poll sample feeds the 10s bucket; each
+ * finalized bucket feeds the next tier up, so a 1min point aggregates
+ * six 10s points (via two 30s points — count-weighted, so the average
+ * is exact, and min-of-mins / max-of-maxes are exact too). Each tier
+ * keeps average, min, and max per metric over its window, and each
+ * tier is retained for its own span: raw 1s samples live in segmented
+ * files for STATS_RAW_RETENTION_DAYS, the rollups for up to 3 years.
+ * A query picks the tier by window span (see queryStats) and reads
+ * only that tier's segments — never the millions of raw points.
+ */
+interface StatsTier {
+  windowMs: number;
+  label: string;
+  /** Segment subdirectory under STATS_DATA_DIR/<container>/. */
+  key: string;
+  /** How far back this tier is kept, in days. */
+  retentionDays: number;
+  /** One segment file covers this much time. */
+  fileSpanMs: number;
+  /** Largest query span served by this tier. */
+  maxSpanMs: number;
+}
+const STATS_TIERS: StatsTier[] = [
+  { windowMs: 10_000, label: "10s", key: "t10s", retentionDays: 90, fileSpanMs: 3_600_000, maxSpanMs: 600_000 },
+  { windowMs: 30_000, label: "30s", key: "t30s", retentionDays: 365, fileSpanMs: 3_600_000, maxSpanMs: 1_800_000 },
+  { windowMs: 60_000, label: "1min", key: "t1m", retentionDays: 365, fileSpanMs: 3_600_000, maxSpanMs: 3_600_000 },
+  { windowMs: 3_600_000, label: "1h", key: "t1h", retentionDays: 1095, fileSpanMs: 86_400_000, maxSpanMs: 259_200_000 },
+  { windowMs: 86_400_000, label: "1d", key: "t1d", retentionDays: 1095, fileSpanMs: 86_400_000, maxSpanMs: 7_776_000_000 },
+  { windowMs: 604_800_000, label: "1wk", key: "t1w", retentionDays: 1095, fileSpanMs: 86_400_000, maxSpanMs: Number.MAX_SAFE_INTEGER },
+];
+/** The raw tier: unaggregated 1s samples, one segment file per hour. */
+const RAW_TIER = { windowMs: 1_000, label: "1s", key: "raw", fileSpanMs: 3_600_000, maxSpanMs: 60_000 };
+
+/** One metric's running aggregate: sum + count give the exact mean, and min/max cascade exactly (min-of-mins, max-of-maxes). Null when no non-null value contributed. */
+interface MetricAgg {
+  sum: number;
+  count: number;
+  min: number | null;
+  max: number | null;
+}
+
+/** In-progress aggregation for one tier window. */
+interface StatsBucket {
+  windowStart: number;
+  usage: MetricAgg;
+  workingSet: MetricAgg;
+  anon: MetricAgg;
+  file: MetricAgg;
+  inactiveFile: MetricAgg;
+  limit: MetricAgg;
+  ratio: MetricAgg;
+  cpu: MetricAgg;
+}
+
+/** The eight aggregated metrics, shared by buckets and by child items fed into them. */
+type AggSet = Pick<StatsBucket, "usage" | "workingSet" | "anon" | "file" | "inactiveFile" | "limit" | "ratio" | "cpu">;
+
+const AGG_KEYS = ["usage", "workingSet", "anon", "file", "inactiveFile", "limit", "ratio", "cpu"] as const;
+
+/** One finalized rollup point as stored in segments and served by /stats. */
+interface StatsRollupPoint {
+  ts: string;
+  resolution_ms: number;
+  /** Raw samples represented (working-set count — the always-present metric). */
+  count: number;
+  usage_avg: number | null;
+  usage_min: number | null;
+  usage_max: number | null;
+  working_set_avg: number | null;
+  working_set_min: number | null;
+  working_set_max: number | null;
+  anon_avg: number | null;
+  anon_min: number | null;
+  anon_max: number | null;
+  file_avg: number | null;
+  file_min: number | null;
+  file_max: number | null;
+  inactive_file_avg: number | null;
+  inactive_file_min: number | null;
+  inactive_file_max: number | null;
+  limit_avg: number | null;
+  limit_min: number | null;
+  limit_max: number | null;
+  usage_ratio_avg: number | null;
+  usage_ratio_min: number | null;
+  usage_ratio_max: number | null;
+  cpu_avg: number | null;
+  cpu_min: number | null;
+  cpu_max: number | null;
+}
+
+/** Open (unfinalized) bucket per tier, per container. Finalized buckets go straight to segments. */
+const openBuckets: Record<string, (StatsBucket | null)[]> = {};
+const latestSample: Record<string, StatsSample> = {};
+/** Wall-clock start of the current above-threshold episode, per container. */
+const pressureSince: Record<string, number> = {};
+
+function emptyAgg(): MetricAgg {
+  return { sum: 0, count: 0, min: null, max: null };
+}
+
+function newBucket(windowStart: number): StatsBucket {
+  return {
+    windowStart,
+    usage: emptyAgg(),
+    workingSet: emptyAgg(),
+    anon: emptyAgg(),
+    file: emptyAgg(),
+    inactiveFile: emptyAgg(),
+    limit: emptyAgg(),
+    ratio: emptyAgg(),
+    cpu: emptyAgg(),
+  };
+}
+
+function aggFromValue(value: number | null): MetricAgg {
+  return value === null ? emptyAgg() : { sum: value, count: 1, min: value, max: value };
+}
+
+/** Merge one child's aggregate into a bucket. Count-weighted, so averages cascade exactly. */
+function combineAgg(into: MetricAgg, child: MetricAgg): void {
+  into.sum += child.sum;
+  into.count += child.count;
+  if (child.min !== null) into.min = into.min === null ? child.min : Math.min(into.min, child.min);
+  if (child.max !== null) into.max = into.max === null ? child.max : Math.max(into.max, child.max);
+}
+
+function feedBucket(bucket: StatsBucket, child: AggSet): void {
+  for (const key of AGG_KEYS) combineAgg(bucket[key], child[key]);
+}
+
+/** A raw sample as an aggregate item: each metric contributes one value. */
+function sampleToAgg(sample: StatsSample): AggSet {
+  return {
+    usage: aggFromValue(sample.usage_bytes),
+    workingSet: aggFromValue(sample.working_set_bytes),
+    anon: aggFromValue(sample.anon_bytes),
+    file: aggFromValue(sample.file_bytes),
+    inactiveFile: aggFromValue(sample.inactive_file_bytes),
+    limit: aggFromValue(sample.limit_bytes),
+    ratio: aggFromValue(sample.usage_ratio),
+    cpu: aggFromValue(sample.cpu_percent),
+  };
+}
+
+function finalizeBucket(bucket: StatsBucket, resolutionMs: number): StatsRollupPoint {
+  const avg = (agg: MetricAgg): number | null => (agg.count > 0 ? agg.sum / agg.count : null);
+  return {
+    ts: new Date(bucket.windowStart).toISOString(),
+    resolution_ms: resolutionMs,
+    count: bucket.workingSet.count,
+    usage_avg: avg(bucket.usage),
+    usage_min: bucket.usage.min,
+    usage_max: bucket.usage.max,
+    working_set_avg: avg(bucket.workingSet),
+    working_set_min: bucket.workingSet.min,
+    working_set_max: bucket.workingSet.max,
+    anon_avg: avg(bucket.anon),
+    anon_min: bucket.anon.min,
+    anon_max: bucket.anon.max,
+    file_avg: avg(bucket.file),
+    file_min: bucket.file.min,
+    file_max: bucket.file.max,
+    inactive_file_avg: avg(bucket.inactiveFile),
+    inactive_file_min: bucket.inactiveFile.min,
+    inactive_file_max: bucket.inactiveFile.max,
+    limit_avg: avg(bucket.limit),
+    limit_min: bucket.limit.min,
+    limit_max: bucket.limit.max,
+    usage_ratio_avg: avg(bucket.ratio),
+    usage_ratio_min: bucket.ratio.min,
+    usage_ratio_max: bucket.ratio.max,
+    cpu_avg: avg(bucket.cpu),
+    cpu_min: bucket.cpu.min,
+    cpu_max: bucket.cpu.max,
+  };
+}
+
+/** A served point back to aggregate form (for rebuilding an open bucket after a restart). Per-metric counts aren't stored, so the point count stands in for each non-null metric — exact whenever Docker reports a field consistently, which it does in practice. */
+function pointToAgg(point: StatsRollupPoint): AggSet {
+  const agg = (avg: number | null, min: number | null, max: number | null): MetricAgg =>
+    avg === null ? emptyAgg() : { sum: avg * point.count, count: point.count, min, max };
+  return {
+    usage: agg(point.usage_avg, point.usage_min, point.usage_max),
+    workingSet: agg(point.working_set_avg, point.working_set_min, point.working_set_max),
+    anon: agg(point.anon_avg, point.anon_min, point.anon_max),
+    file: agg(point.file_avg, point.file_min, point.file_max),
+    inactiveFile: agg(point.inactive_file_avg, point.inactive_file_min, point.inactive_file_max),
+    limit: agg(point.limit_avg, point.limit_min, point.limit_max),
+    ratio: agg(point.usage_ratio_avg, point.usage_ratio_min, point.usage_ratio_max),
+    cpu: agg(point.cpu_avg, point.cpu_min, point.cpu_max),
+  };
+}
+
+/** A raw sample as a served point: avg = min = max = the value. */
+function pointFromSample(sample: StatsSample): StatsRollupPoint {
+  const point = (value: number | null): { avg: number | null; min: number | null; max: number | null } => ({
+    avg: value,
+    min: value,
+    max: value,
+  });
+  const usage = point(sample.usage_bytes);
+  const workingSet = point(sample.working_set_bytes);
+  const anon = point(sample.anon_bytes);
+  const file = point(sample.file_bytes);
+  const inactiveFile = point(sample.inactive_file_bytes);
+  const limit = point(sample.limit_bytes);
+  const ratio = point(sample.usage_ratio);
+  const cpu = point(sample.cpu_percent);
+  return {
+    ts: sample.ts,
+    resolution_ms: RAW_TIER.windowMs,
+    count: 1,
+    usage_avg: usage.avg,
+    usage_min: usage.min,
+    usage_max: usage.max,
+    working_set_avg: workingSet.avg,
+    working_set_min: workingSet.min,
+    working_set_max: workingSet.max,
+    anon_avg: anon.avg,
+    anon_min: anon.min,
+    anon_max: anon.max,
+    file_avg: file.avg,
+    file_min: file.min,
+    file_max: file.max,
+    inactive_file_avg: inactiveFile.avg,
+    inactive_file_min: inactiveFile.min,
+    inactive_file_max: inactiveFile.max,
+    limit_avg: limit.avg,
+    limit_min: limit.min,
+    limit_max: limit.max,
+    usage_ratio_avg: ratio.avg,
+    usage_ratio_min: ratio.min,
+    usage_ratio_max: ratio.max,
+    cpu_avg: cpu.avg,
+    cpu_min: cpu.min,
+    cpu_max: cpu.max,
+  };
+}
+
+/** Ingest one raw poll sample: append it to the raw segments, then feed the cascade starting at the 10s tier. */
+function ingestSample(name: string, sample: StatsSample): void {
+  latestSample[name] = sample;
+  const parsed = Date.parse(sample.ts);
+  const sampleMs = Number.isFinite(parsed) ? parsed : Date.now();
+  appendRawSample(name, sample, sampleMs);
+  const secondStart = Math.floor(sampleMs / RAW_TIER.windowMs) * RAW_TIER.windowMs;
+  feedTier(name, 0, sampleToAgg(sample), secondStart);
+}
+
+/**
+ * Feed one aggregate item into a tier's open bucket, sealing the bucket
+ * (append to segments + cascade upward) when the item crosses into a
+ * newer window. Windows nest exactly (each window divides the next),
+ * so the child's window start always maps to the right parent window.
+ */
+function feedTier(name: string, tierIdx: number, child: AggSet, childWindowStart: number): void {
+  const tier = STATS_TIERS[tierIdx];
+  const buckets = openBuckets[name] ?? (openBuckets[name] = STATS_TIERS.map(() => null));
+  const windowStart = Math.floor(childWindowStart / tier.windowMs) * tier.windowMs;
+  let bucket = buckets[tierIdx];
+  if (bucket === null) {
+    bucket = buckets[tierIdx] = newBucket(windowStart);
+  } else if (windowStart > bucket.windowStart) {
+    finalizeTierBucket(name, tierIdx, bucket);
+    bucket = buckets[tierIdx] = newBucket(windowStart);
+  }
+  // windowStart < bucket.windowStart (a late item) accumulates into the
+  // current bucket rather than reopening a sealed window.
+  feedBucket(bucket, child);
+}
+
+/** Seal a bucket: append the point to the tier's segments, then feed it upward. */
+function finalizeTierBucket(name: string, tierIdx: number, bucket: StatsBucket): void {
+  const tier = STATS_TIERS[tierIdx];
+  const point = finalizeBucket(bucket, tier.windowMs);
+  if (point.count === 0) return; // empty bucket — nothing to store
+  appendRollupPoint(name, tier, point);
+  const next = tierIdx + 1;
+  if (next < STATS_TIERS.length) feedTier(name, next, bucket, bucket.windowStart);
+}
+
+// ---------------------------------------------------------------------------
+// Stats history persistence
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Stats segment store
+// ---------------------------------------------------------------------------
+//
+// Raw samples and rollup points live in append-only segment files:
+//
+//   <STATS_DATA_DIR>/<container>/raw/<YYYY-MM>/<YYYY-MM-DD-HH>.jsonl[.gz]
+//   <STATS_DATA_DIR>/<container>/t10s|t30s|t1m/<YYYY-MM>/<YYYY-MM-DD-HH>.jsonl[.gz]
+//   <STATS_DATA_DIR>/<container>/t1h|t1d|t1w/<YYYY-MM>/<YYYY-MM-DD>.jsonl[.gz]
+//
+// One segment covers fileSpanMs; closed segments are gzipped in the
+// background. Reads touch only the segments overlapping the queried
+// window, so a 1-minute query reads one hour-file (~2 ms measured),
+// never the millions of retained points. All I/O failures warn and
+// keep the monitor running — the store must never take down alarming
+// or the log server.
+
+function segmentName(periodStart: number, fileSpanMs: number): string {
+  const d = new Date(periodStart);
+  const pad = (n: number): string => String(n).padStart(2, "0");
+  const date = `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())}`;
+  return fileSpanMs < 86_400_000 ? `${date}-${pad(d.getUTCHours())}` : date;
+}
+
+function segmentPath(container: string, key: string, periodStart: number, fileSpanMs: number): string {
+  const name = segmentName(periodStart, fileSpanMs);
+  return join(STATS_DATA_DIR, container, key, name.slice(0, 7), `${name}.jsonl`);
+}
+
+/** "2026-10-27-14.jsonl[.gz]" / "2026-10-27.jsonl[.gz]" -> period start ms (UTC), or null. */
+function parseSegmentName(file: string): number | null {
+  const m = /^(\d{4})-(\d{2})-(\d{2})(?:-(\d{2}))?\.jsonl(?:\.gz)?$/.exec(file);
+  if (!m) return null;
+  const ms = Date.parse(`${m[1]}-${m[2]}-${m[3]}T${m[4] ?? "00"}:00:00.000Z`);
+  return Number.isFinite(ms) ? ms : null;
+}
+
+/** Currently-open segment per container+key: path + its period start. */
+const openSegments: Record<string, { path: string; periodStart: number }> = {};
+
+function appendToSegment(container: string, key: string, fileSpanMs: number, tsMs: number, line: string): void {
+  const periodStart = Math.floor(tsMs / fileSpanMs) * fileSpanMs;
+  const cacheKey = `${container}/${key}`;
+  let seg = openSegments[cacheKey];
+  if (!seg || seg.periodStart !== periodStart) {
+    if (seg) closeSegment(seg.path);
+    const path = segmentPath(container, key, periodStart, fileSpanMs);
+    try {
+      mkdirSync(dirname(path), { recursive: true });
+    } catch (e: unknown) {
+      console.warn("[stats] segment mkdir failed:", e instanceof Error ? e.message : String(e));
+      return;
+    }
+    seg = openSegments[cacheKey] = { path, periodStart };
+  }
+  try {
+    appendFileSync(seg.path, `${line}\n`);
+  } catch (e: unknown) {
+    console.warn("[stats] segment append failed:", e instanceof Error ? e.message : String(e));
+  }
+}
+
+/**
+ * Gzip a closed segment in the background; failures log and leave the
+ * .jsonl for the prune sweep to retry. A sample for an already-gzipped
+ * period would be dropped from reads (listSegments prefers .gz) — that
+ * can't happen with live Docker timestamps, which are always current.
+ */
+function closeSegment(path: string): void {
+  readFile(path, (readErr, data) => {
+    if (readErr) return;
+    gzip(data, (gzipErr, gzipped) => {
+      if (gzipErr) {
+        console.warn("[stats] segment gzip failed:", gzipErr.message);
+        return;
+      }
+      writeFile(`${path}.gz`, gzipped, (writeErr) => {
+        if (writeErr) {
+          console.warn("[stats] segment gzip write failed:", writeErr.message);
+          return;
+        }
+        unlink(path, () => {
+          /* already gone is fine */
+        });
+      });
+    });
+  });
+}
+
+function appendRawSample(name: string, sample: StatsSample, sampleMs: number): void {
+  appendToSegment(name, RAW_TIER.key, RAW_TIER.fileSpanMs, sampleMs, JSON.stringify(sample));
+}
+
+function appendRollupPoint(name: string, tier: StatsTier, point: StatsRollupPoint): void {
+  const tsMs = Date.parse(point.ts);
+  if (!Number.isFinite(tsMs)) return;
+  appendToSegment(name, tier.key, tier.fileSpanMs, tsMs, JSON.stringify(point));
+}
+
+function readSegmentLines(path: string): string[] {
+  try {
+    const raw = readFileSync(path);
+    const text = path.endsWith(".gz") ? gunzipSync(raw).toString("utf-8") : raw.toString("utf-8");
+    return text.split("\n").filter((line) => line.length > 0);
+  } catch (e: unknown) {
+    console.warn("[stats] segment read failed:", e instanceof Error ? e.message : String(e));
+    return [];
+  }
+}
+
+/** Segment files overlapping [fromMs, toMs], oldest-first. Prefers .gz, falls back to .jsonl. */
+function listSegments(container: string, key: string, fileSpanMs: number, fromMs: number, toMs: number): string[] {
+  const out: string[] = [];
+  const firstPeriod = Math.floor(fromMs / fileSpanMs) * fileSpanMs;
+  const lastPeriod = Math.floor(toMs / fileSpanMs) * fileSpanMs;
+  for (let period = firstPeriod; period <= lastPeriod; period += fileSpanMs) {
+    const base = segmentPath(container, key, period, fileSpanMs);
+    if (existsSync(`${base}.gz`)) out.push(`${base}.gz`);
+    else if (existsSync(base)) out.push(base);
+  }
+  return out;
+}
+
+function isValidSample(p: unknown): p is StatsSample {
+  if (typeof p !== "object" || p === null) return false;
+  const s = p as Record<string, unknown>;
+  return (
+    typeof s.ts === "string" &&
+    Number.isFinite(Date.parse(s.ts)) &&
+    typeof s.usage_bytes === "number" &&
+    typeof s.working_set_bytes === "number" &&
+    typeof s.resolution_ms === "number"
+  );
+}
+
+function isValidRollupPoint(p: unknown): p is StatsRollupPoint {
+  if (typeof p !== "object" || p === null) return false;
+  const s = p as Record<string, unknown>;
+  return (
+    typeof s.ts === "string" &&
+    Number.isFinite(Date.parse(s.ts)) &&
+    typeof s.resolution_ms === "number" &&
+    typeof s.count === "number" &&
+    (typeof s.working_set_avg === "number" || s.working_set_avg === null)
+  );
+}
+
+/** Parse + validate + window-filter one tier's segments. Malformed lines (torn trailing line from a crash mid-append) are skipped. */
+function parsePoints<T extends { ts: string }>(
+  files: string[],
+  isValid: (v: unknown) => v is T,
+  fromMs: number,
+  toMs: number
+): T[] {
+  const points: T[] = [];
+  for (const file of files) {
+    for (const line of readSegmentLines(file)) {
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(line);
+      } catch {
+        continue;
+      }
+      if (!isValid(parsed)) continue;
+      const ts = Date.parse(parsed.ts);
+      if (Number.isFinite(ts) && ts >= fromMs && ts <= toMs) points.push(parsed);
+    }
+  }
+  points.sort((a, b) => Date.parse(a.ts) - Date.parse(b.ts));
+  return points;
+}
+
+function readRawRange(container: string, fromMs: number, toMs: number): StatsSample[] {
+  return parsePoints(listSegments(container, RAW_TIER.key, RAW_TIER.fileSpanMs, fromMs, toMs), isValidSample, fromMs, toMs);
+}
+
+function readRollupRange(container: string, tier: StatsTier, fromMs: number, toMs: number): StatsRollupPoint[] {
+  return parsePoints(listSegments(container, tier.key, tier.fileSpanMs, fromMs, toMs), isValidRollupPoint, fromMs, toMs);
+}
+
+/**
+ * Serve a window: pick the tier by span (a 1min window gets 1s points,
+ * a 3d window gets 1h points), read only that tier's segments
+ * overlapping the window, and merge the tier's open bucket (the partial
+ * current window, finalized on the fly). Bounded by construction: at
+ * most ~156 points for any span.
+ */
+function queryStats(container: string, spanMs: number, endMs: number): { points: StatsRollupPoint[]; resolutionMs: number } {
+  const fromMs = endMs - spanMs;
+  if (spanMs <= RAW_TIER.maxSpanMs) {
+    return { points: readRawRange(container, fromMs, endMs).map(pointFromSample), resolutionMs: RAW_TIER.windowMs };
+  }
+  for (let i = 0; i < STATS_TIERS.length; i++) {
+    const tier = STATS_TIERS[i];
+    if (spanMs > tier.maxSpanMs) continue;
+    const points = readRollupRange(container, tier, fromMs, endMs);
+    const open = openBuckets[container]?.[i] ?? null;
+    if (open !== null) {
+      const point = finalizeBucket(open, tier.windowMs);
+      const tsMs = open.windowStart;
+      if (point.count > 0 && tsMs >= fromMs && tsMs <= endMs) {
+        const idx = points.findIndex((p) => Date.parse(p.ts) === tsMs);
+        if (idx >= 0) points[idx] = point;
+        else points.push(point);
+        points.sort((a, b) => Date.parse(a.ts) - Date.parse(b.ts));
+      }
+    }
+    return { points, resolutionMs: tier.windowMs };
+  }
+  // Unreachable: the 1wk tier's maxSpanMs is MAX_SAFE_INTEGER.
+  return { points: [], resolutionMs: RAW_TIER.windowMs };
+}
+
+/**
+ * Rebuild open buckets after a (re)start from the tier below: the
+ * current window's children are already on disk (raw samples for the
+ * 10s tier, finalized child points above that), so a restart loses
+ * nothing — the partial windows resume exactly. Runs bottom-up.
+ */
+function rebuildOpenBuckets(): void {
+  let containers: string[];
+  try {
+    containers = readdirSync(STATS_DATA_DIR, { withFileTypes: true })
+      .filter((e) => e.isDirectory())
+      .map((e) => e.name);
+  } catch {
+    return; // no store yet — first boot
+  }
+  const now = Date.now();
+  for (const name of containers) {
+    const buckets: (StatsBucket | null)[] = STATS_TIERS.map(() => null);
+    openBuckets[name] = buckets;
+    const w0 = Math.floor(now / STATS_TIERS[0].windowMs) * STATS_TIERS[0].windowMs;
+    const raws = readRawRange(name, w0, now);
+    if (raws.length > 0) {
+      const bucket = newBucket(w0);
+      for (const s of raws) feedBucket(bucket, sampleToAgg(s));
+      buckets[0] = bucket;
+    }
+    for (let i = 1; i < STATS_TIERS.length; i++) {
+      const tier = STATS_TIERS[i];
+      const childTier = STATS_TIERS[i - 1];
+      const w = Math.floor(now / tier.windowMs) * tier.windowMs;
+      const children = readRollupRange(name, childTier, w, now);
+      const childOpen = buckets[i - 1];
+      if (childOpen !== null) {
+        const p = finalizeBucket(childOpen, childTier.windowMs);
+        if (p.count > 0) children.push(p);
+      }
+      if (children.length === 0) continue;
+      const bucket = newBucket(w);
+      for (const p of children) feedBucket(bucket, pointToAgg(p));
+      buckets[i] = bucket;
+    }
+  }
+}
+
+/**
+ * Daily sweep: gzip stale uncompressed segments (closed periods whose
+ * .gz is missing — e.g. a container stopped mid-hour; a 1h grace period
+ * keeps the rollover path from racing it) and delete segments older
+ * than their tier's retention. Never throws.
+ */
+function pruneStatsData(): void {
+  const now = Date.now();
+  let containers: string[];
+  try {
+    containers = readdirSync(STATS_DATA_DIR, { withFileTypes: true })
+      .filter((e) => e.isDirectory())
+      .map((e) => e.name);
+  } catch {
+    return;
+  }
+  const tiers: { key: string; fileSpanMs: number; retentionDays: number }[] = [
+    { key: RAW_TIER.key, fileSpanMs: RAW_TIER.fileSpanMs, retentionDays: STATS_RAW_RETENTION_DAYS },
+    ...STATS_TIERS,
+  ];
+  for (const name of containers) {
+    for (const tier of tiers) {
+      const cutoff = now - tier.retentionDays * 86_400_000;
+      const tierDir = join(STATS_DATA_DIR, name, tier.key);
+      let months: string[];
+      try {
+        months = readdirSync(tierDir, { withFileTypes: true })
+          .filter((e) => e.isDirectory())
+          .map((e) => e.name);
+      } catch {
+        continue;
+      }
+      for (const month of months) {
+        const monthDir = join(tierDir, month);
+        let files: string[];
+        try {
+          files = readdirSync(monthDir);
+        } catch {
+          continue;
+        }
+        for (const file of files) {
+          const periodStart = parseSegmentName(file);
+          if (periodStart === null) continue;
+          const path = join(monthDir, file);
+          try {
+            if (periodStart + tier.fileSpanMs <= cutoff) {
+              unlinkSync(path);
+            } else if (
+              file.endsWith(".jsonl") &&
+              periodStart + tier.fileSpanMs < now - 3_600_000 &&
+              !existsSync(`${path}.gz`)
+            ) {
+              closeSegment(path);
+            }
+          } catch (e: unknown) {
+            console.warn("[stats] prune failed for", path, e instanceof Error ? e.message : String(e));
+          }
+        }
+      }
+    }
+  }
+}
 
 /**
  * Compute the `docker stats`-style CPU percentage. Returns null when we
@@ -494,13 +1115,36 @@ function calcWorkingSetBytes(mem: DockerStatsResponse["memory_stats"]): number {
   return usage;
 }
 
+// Stats polls run every second; a hung socket must fail fast rather than
+// stall the cycle behind the in-flight guard below.
+const STATS_REQUEST_TIMEOUT_MS = 10_000;
+
+let statsPollInFlight = false;
+
+/**
+ * Overlap guard: at a 1s cadence a slow Docker socket must not stack
+ * overlapping poll cycles (each cycle fans out one stats request per
+ * container). A tick that lands while the previous cycle is still
+ * running is skipped — the next tick picks the containers up.
+ */
 async function pollStats(): Promise<void> {
+  if (statsPollInFlight) return;
+  statsPollInFlight = true;
+  try {
+    await pollStatsOnce();
+  } finally {
+    statsPollInFlight = false;
+  }
+}
+
+async function pollStatsOnce(): Promise<void> {
   await refreshTargets();
   for (const name of targets) {
     try {
       const { status, body } = await dockerRequest<DockerStatsResponse>(
         "GET",
-        `/containers/${name}/stats?stream=false`
+        `/containers/${name}/stats?stream=false`,
+        STATS_REQUEST_TIMEOUT_MS
       );
       if (status !== 200) continue;
 
@@ -528,23 +1172,27 @@ async function pollStats(): Promise<void> {
         limit_bytes: limit,
         usage_ratio: usageRatio,
         cpu_percent: cpuPercent,
+        resolution_ms: STATS_TIERS[0].windowMs,
       };
 
-      const ring = statsHistory[name] ?? [];
-      ring.push(sample);
-      if (ring.length > STATS_HISTORY_SIZE) ring.shift();
-      statsHistory[name] = ring;
+      ingestSample(name, sample);
 
-      // Sustained memory-pressure alarm: N consecutive samples above
-      // the ratio threshold. Only fires when the container has an
-      // explicit memory limit (usage_ratio non-null). Uses `>=` (not
-      // `===`) so continued pressure re-attempts the alarm on every
-      // subsequent poll — `ALARM_COOLDOWN_MS` gates the actual
-      // Discord spam. With `===` a single ping fired at poll N and
-      // then stayed silent for the entire pressure episode.
+      // Sustained memory-pressure alarm: the ratio must stay above the
+      // threshold for MEMORY_PRESSURE_SUSTAINED_MS of wall-clock time (a
+      // poll-count rule would fire on any 3-second spike at 1s polling).
+      // Only fires when the container has an explicit memory limit
+      // (usage_ratio non-null). The elapsed check uses `>=` so continued
+      // pressure re-attempts the alarm on every subsequent poll —
+      // `ALARM_COOLDOWN_MS` gates the actual Discord spam. With `===` a
+      // single ping fired once and then stayed silent for the entire
+      // pressure episode.
       if (usageRatio !== null && usageRatio >= MEMORY_PRESSURE_RATIO) {
-        pressureCount[name] = (pressureCount[name] ?? 0) + 1;
-        if (pressureCount[name] >= MEMORY_PRESSURE_SUSTAINED) {
+        let since = pressureSince[name];
+        if (since === undefined) {
+          since = Date.now();
+          pressureSince[name] = since;
+        }
+        if (Date.now() - since >= MEMORY_PRESSURE_SUSTAINED_MS) {
           const pct = Math.round(usageRatio * 100);
           const workingSetMB = Math.round(workingSet / 1024 / 1024);
           const usageMB = Math.round(usage / 1024 / 1024);
@@ -552,11 +1200,11 @@ async function pollStats(): Promise<void> {
           await sendAlarm(
             "MEMORY_PRESSURE",
             name,
-            `Memory at ${pct}% of container limit (${workingSetMB} MB / ${limitMB} MB working set, ${usageMB} MB with page cache) sustained across ${MEMORY_PRESSURE_SUSTAINED}+ polls — OOM likely if trend continues.`
+            `Memory at ${pct}% of container limit (${workingSetMB} MB / ${limitMB} MB working set, ${usageMB} MB with page cache) sustained ${Math.round(MEMORY_PRESSURE_SUSTAINED_MS / 1000)}s+ — OOM likely if trend continues.`
           );
         }
       } else if (usageRatio !== null) {
-        pressureCount[name] = 0;
+        delete pressureSince[name];
       }
     } catch (e: unknown) {
       const msg = e instanceof Error ? e.message : String(e);
@@ -1046,14 +1694,24 @@ async function handleRequest(
       sendJson(res, 403, { error: "Container not monitored" });
       return;
     }
-    const ring = statsHistory[container] ?? [];
-    const latest = ring.length > 0 ? ring[ring.length - 1] : null;
+    // Windowed query: `span` seconds ending at `end` (default: last hour
+    // ending now). The span picks the tier — see queryStats. Both params
+    // are clamped so a malformed query can't scan the whole store.
+    const spanRaw = parseInt(url.searchParams.get("span") ?? "3600", 10);
+    const spanS = Number.isFinite(spanRaw) && spanRaw > 0 ? Math.min(spanRaw, 3 * 365.25 * 24 * 3600) : 3600;
+    const endRaw = url.searchParams.get("end");
+    let endMs = endRaw ? Date.parse(endRaw) : Date.now();
+    if (!Number.isFinite(endMs) || endMs > Date.now()) endMs = Date.now();
+    const { points, resolutionMs } = queryStats(container, spanS * 1000, endMs);
     sendJson(res, 200, {
       container,
       poll_interval_ms: STATS_POLL_INTERVAL_MS,
       pressure_threshold_ratio: MEMORY_PRESSURE_RATIO,
-      latest,
-      history: ring,
+      latest: latestSample[container] ?? null,
+      history: points,
+      span_s: spanS,
+      end: new Date(endMs).toISOString(),
+      resolution_ms: resolutionMs,
     });
     return;
   }
@@ -1154,14 +1812,20 @@ server.listen(LOG_PORT, () => {
       : `[monitor] Targets: ${MONITOR_TARGETS.join(", ") || "(none)"}`
   );
   console.log(`[monitor] Health poll interval: ${HEALTH_POLL_INTERVAL_MS}ms`);
-  console.log(`[monitor] Stats poll interval: ${STATS_POLL_INTERVAL_MS}ms · history=${STATS_HISTORY_SIZE} · pressure=${MEMORY_PRESSURE_RATIO}×${MEMORY_PRESSURE_SUSTAINED}`);
+  console.log(
+    `[monitor] Stats poll interval: ${STATS_POLL_INTERVAL_MS}ms · store: ${STATS_DATA_DIR} · raw 1s × ${STATS_RAW_RETENTION_DAYS}d · rollups: ${STATS_TIERS.map((t) => `${t.label}×${t.retentionDays}d`).join(" ")} · pressure=${MEMORY_PRESSURE_RATIO} sustained ${MEMORY_PRESSURE_SUSTAINED_MS}ms`
+  );
   if (!DISCORD_WEBHOOK) console.warn("[monitor] DISCORD_ALARM_WEBHOOK not set — alarms disabled");
   if (!LOG_SERVER_TOKEN) console.warn("[monitor] LOG_SERVER_TOKEN not set — log API is open");
 });
+
+rebuildOpenBuckets();
+pruneStatsData();
 
 setInterval(() => void pollHealth(), HEALTH_POLL_INTERVAL_MS);
 void pollHealth(); // immediate first check
 setInterval(() => void pollStats(), STATS_POLL_INTERVAL_MS);
 void pollStats(); // immediate first sample
+setInterval(pruneStatsData, 24 * 60 * 60 * 1000); // gzip stale segments, drop expired ones
 setInterval(sweepSessions, 60 * 60 * 1000); // drop expired login sessions
 void watchEvents();
