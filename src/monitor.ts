@@ -230,7 +230,7 @@ async function discoverTargets(): Promise<void> {
     else console.warn(`[targets] no containers in compose project "${MONITOR_PROJECT}"`);
     for (const name of targets) {
       if (next.includes(name)) continue;
-      for (const state of [healthState, healthFailCount, crashedAt, openBuckets, pressureSince, latestSample]) delete state[name];
+      for (const state of [healthState, healthFailCount, crashedAt, openBuckets, pressureSince, latestSample, prevCounters]) delete state[name];
     }
     targets = next;
   } catch (e: unknown) {
@@ -412,7 +412,7 @@ async function pollHealth(): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------
-// Container memory / CPU stats polling
+// Container stats polling (memory, CPU, network, block I/O, PIDs)
 // ---------------------------------------------------------------------------
 
 /**
@@ -425,6 +425,15 @@ async function pollHealth(): Promise<void> {
  * breakdown (null when Docker doesn't report them). `cpu_percent` is a nominal
  * single-core % (Docker's `docker stats` calculation) so we can spot a runaway
  * loop.
+ *
+ * Network and block I/O arrive from Docker as cumulative counters, so the
+ * sample stores both the cumulative totals (for "total so far" in the
+ * latest sample) and the per-second rates derived from the delta since the
+ * previous poll (for history: a cumulative counter's average/min/max over a
+ * rollup window would be meaningless, but a rate's are not). Rates are null
+ * on the first poll after startup, when a counter is absent, or when a
+ * counter resets (container recreate) — never negative. `pids_current` is
+ * a point value, so it aggregates like memory/CPU.
  */
 interface StatsSample {
   ts: string;
@@ -436,6 +445,17 @@ interface StatsSample {
   limit_bytes: number | null;
   usage_ratio: number | null;
   cpu_percent: number | null;
+  net_rx_bytes_per_sec: number | null;
+  net_tx_bytes_per_sec: number | null;
+  net_rx_packets_per_sec: number | null;
+  net_tx_packets_per_sec: number | null;
+  net_rx_bytes_total: number | null;
+  net_tx_bytes_total: number | null;
+  blk_read_bytes_per_sec: number | null;
+  blk_write_bytes_per_sec: number | null;
+  blk_read_bytes_total: number | null;
+  blk_write_bytes_total: number | null;
+  pids_current: number | null;
   /** Aggregation window that produced this point (1s for raw samples). */
   resolution_ms: number;
 }
@@ -456,6 +476,18 @@ interface DockerStatsResponse {
     cpu_usage?: { total_usage?: number };
     system_cpu_usage?: number;
   };
+  networks?: Record<string, {
+    rx_bytes?: number;
+    tx_bytes?: number;
+    rx_packets?: number;
+    tx_packets?: number;
+  }> | null;
+  blkio_stats?: {
+    io_service_bytes_recursive?: { op?: string; value?: number }[] | null;
+  } | null;
+  pids_stats?: {
+    current?: number;
+  } | null;
 }
 
 /**
@@ -500,7 +532,9 @@ interface MetricAgg {
   max: number | null;
 }
 
-/** In-progress aggregation for one tier window. */
+/** In-progress aggregation for one tier window. Rate/PID metrics aggregate
+ * like the memory/CPU ones; cumulative network/block totals are latest-only
+ * and never enter a bucket. */
 interface StatsBucket {
   windowStart: number;
   usage: MetricAgg;
@@ -511,12 +545,19 @@ interface StatsBucket {
   limit: MetricAgg;
   ratio: MetricAgg;
   cpu: MetricAgg;
+  netRx: MetricAgg;
+  netTx: MetricAgg;
+  netRxPackets: MetricAgg;
+  netTxPackets: MetricAgg;
+  blkRead: MetricAgg;
+  blkWrite: MetricAgg;
+  pids: MetricAgg;
 }
 
-/** The eight aggregated metrics, shared by buckets and by child items fed into them. */
-type AggSet = Pick<StatsBucket, "usage" | "workingSet" | "anon" | "file" | "inactiveFile" | "limit" | "ratio" | "cpu">;
+/** The aggregated metrics, shared by buckets and by child items fed into them. */
+type AggSet = Pick<StatsBucket, "usage" | "workingSet" | "anon" | "file" | "inactiveFile" | "limit" | "ratio" | "cpu" | "netRx" | "netTx" | "netRxPackets" | "netTxPackets" | "blkRead" | "blkWrite" | "pids">;
 
-const AGG_KEYS = ["usage", "workingSet", "anon", "file", "inactiveFile", "limit", "ratio", "cpu"] as const;
+const AGG_KEYS = ["usage", "workingSet", "anon", "file", "inactiveFile", "limit", "ratio", "cpu", "netRx", "netTx", "netRxPackets", "netTxPackets", "blkRead", "blkWrite", "pids"] as const;
 
 /** One finalized rollup point as stored in segments and served by /stats. */
 interface StatsRollupPoint {
@@ -548,11 +589,46 @@ interface StatsRollupPoint {
   cpu_avg: number | null;
   cpu_min: number | null;
   cpu_max: number | null;
+  net_rx_bytes_per_sec_avg: number | null;
+  net_rx_bytes_per_sec_min: number | null;
+  net_rx_bytes_per_sec_max: number | null;
+  net_tx_bytes_per_sec_avg: number | null;
+  net_tx_bytes_per_sec_min: number | null;
+  net_tx_bytes_per_sec_max: number | null;
+  net_rx_packets_per_sec_avg: number | null;
+  net_rx_packets_per_sec_min: number | null;
+  net_rx_packets_per_sec_max: number | null;
+  net_tx_packets_per_sec_avg: number | null;
+  net_tx_packets_per_sec_min: number | null;
+  net_tx_packets_per_sec_max: number | null;
+  blk_read_bytes_per_sec_avg: number | null;
+  blk_read_bytes_per_sec_min: number | null;
+  blk_read_bytes_per_sec_max: number | null;
+  blk_write_bytes_per_sec_avg: number | null;
+  blk_write_bytes_per_sec_min: number | null;
+  blk_write_bytes_per_sec_max: number | null;
+  pids_current_avg: number | null;
+  pids_current_min: number | null;
+  pids_current_max: number | null;
 }
 
 /** Open (unfinalized) bucket per tier, per container. Finalized buckets go straight to segments. */
 const openBuckets: Record<string, (StatsBucket | null)[]> = {};
 const latestSample: Record<string, StatsSample> = {};
+/** Host CPU count last seen on a stats poll (`online_cpus`, identical for
+ * every container on the host). Powers the overview CPU-capacity ratio. */
+let hostCpuCount: number | null = null;
+/** Previous poll's cumulative network/block counters + read time, per
+ * container, for per-second rate derivation. Reset on counter reset. */
+const prevCounters: Record<string, {
+  readMs: number;
+  netRx: number | null;
+  netTx: number | null;
+  netRxPackets: number | null;
+  netTxPackets: number | null;
+  blkRead: number | null;
+  blkWrite: number | null;
+} | null> = {};
 /** Wall-clock start of the current above-threshold episode, per container. */
 const pressureSince: Record<string, number> = {};
 
@@ -571,6 +647,13 @@ function newBucket(windowStart: number): StatsBucket {
     limit: emptyAgg(),
     ratio: emptyAgg(),
     cpu: emptyAgg(),
+    netRx: emptyAgg(),
+    netTx: emptyAgg(),
+    netRxPackets: emptyAgg(),
+    netTxPackets: emptyAgg(),
+    blkRead: emptyAgg(),
+    blkWrite: emptyAgg(),
+    pids: emptyAgg(),
   };
 }
 
@@ -590,7 +673,8 @@ function feedBucket(bucket: StatsBucket, child: AggSet): void {
   for (const key of AGG_KEYS) combineAgg(bucket[key], child[key]);
 }
 
-/** A raw sample as an aggregate item: each metric contributes one value. */
+/** A raw sample as an aggregate item: each metric contributes one value.
+ * Cumulative totals deliberately excluded — they are latest-only. */
 function sampleToAgg(sample: StatsSample): AggSet {
   return {
     usage: aggFromValue(sample.usage_bytes),
@@ -601,6 +685,13 @@ function sampleToAgg(sample: StatsSample): AggSet {
     limit: aggFromValue(sample.limit_bytes),
     ratio: aggFromValue(sample.usage_ratio),
     cpu: aggFromValue(sample.cpu_percent),
+    netRx: aggFromValue(sample.net_rx_bytes_per_sec),
+    netTx: aggFromValue(sample.net_tx_bytes_per_sec),
+    netRxPackets: aggFromValue(sample.net_rx_packets_per_sec),
+    netTxPackets: aggFromValue(sample.net_tx_packets_per_sec),
+    blkRead: aggFromValue(sample.blk_read_bytes_per_sec),
+    blkWrite: aggFromValue(sample.blk_write_bytes_per_sec),
+    pids: aggFromValue(sample.pids_current),
   };
 }
 
@@ -634,13 +725,40 @@ function finalizeBucket(bucket: StatsBucket, resolutionMs: number): StatsRollupP
     cpu_avg: avg(bucket.cpu),
     cpu_min: bucket.cpu.min,
     cpu_max: bucket.cpu.max,
+    net_rx_bytes_per_sec_avg: avg(bucket.netRx),
+    net_rx_bytes_per_sec_min: bucket.netRx.min,
+    net_rx_bytes_per_sec_max: bucket.netRx.max,
+    net_tx_bytes_per_sec_avg: avg(bucket.netTx),
+    net_tx_bytes_per_sec_min: bucket.netTx.min,
+    net_tx_bytes_per_sec_max: bucket.netTx.max,
+    net_rx_packets_per_sec_avg: avg(bucket.netRxPackets),
+    net_rx_packets_per_sec_min: bucket.netRxPackets.min,
+    net_rx_packets_per_sec_max: bucket.netRxPackets.max,
+    net_tx_packets_per_sec_avg: avg(bucket.netTxPackets),
+    net_tx_packets_per_sec_min: bucket.netTxPackets.min,
+    net_tx_packets_per_sec_max: bucket.netTxPackets.max,
+    blk_read_bytes_per_sec_avg: avg(bucket.blkRead),
+    blk_read_bytes_per_sec_min: bucket.blkRead.min,
+    blk_read_bytes_per_sec_max: bucket.blkRead.max,
+    blk_write_bytes_per_sec_avg: avg(bucket.blkWrite),
+    blk_write_bytes_per_sec_min: bucket.blkWrite.min,
+    blk_write_bytes_per_sec_max: bucket.blkWrite.max,
+    pids_current_avg: avg(bucket.pids),
+    pids_current_min: bucket.pids.min,
+    pids_current_max: bucket.pids.max,
   };
 }
 
-/** A served point back to aggregate form (for rebuilding an open bucket after a restart). Per-metric counts aren't stored, so the point count stands in for each non-null metric — exact whenever Docker reports a field consistently, which it does in practice. */
+/** A served point back to aggregate form (for rebuilding an open bucket after a restart). Per-metric counts aren't stored, so the point count stands in for each non-null metric — exact whenever Docker reports a field consistently, which it does in practice. Fields absent from segments written before they existed (or non-numeric) coerce to null, so old segments rebuild as gaps for the new metrics instead of NaN. */
 function pointToAgg(point: StatsRollupPoint): AggSet {
-  const agg = (avg: number | null, min: number | null, max: number | null): MetricAgg =>
-    avg === null ? emptyAgg() : { sum: avg * point.count, count: point.count, min, max };
+  const numField = (v: unknown): number | null =>
+    typeof v === "number" && Number.isFinite(v) ? v : null;
+  const agg = (avg: unknown, min: unknown, max: unknown): MetricAgg => {
+    const a = numField(avg);
+    return a === null
+      ? emptyAgg()
+      : { sum: a * point.count, count: point.count, min: numField(min), max: numField(max) };
+  };
   return {
     usage: agg(point.usage_avg, point.usage_min, point.usage_max),
     workingSet: agg(point.working_set_avg, point.working_set_min, point.working_set_max),
@@ -650,10 +768,18 @@ function pointToAgg(point: StatsRollupPoint): AggSet {
     limit: agg(point.limit_avg, point.limit_min, point.limit_max),
     ratio: agg(point.usage_ratio_avg, point.usage_ratio_min, point.usage_ratio_max),
     cpu: agg(point.cpu_avg, point.cpu_min, point.cpu_max),
+    netRx: agg(point.net_rx_bytes_per_sec_avg, point.net_rx_bytes_per_sec_min, point.net_rx_bytes_per_sec_max),
+    netTx: agg(point.net_tx_bytes_per_sec_avg, point.net_tx_bytes_per_sec_min, point.net_tx_bytes_per_sec_max),
+    netRxPackets: agg(point.net_rx_packets_per_sec_avg, point.net_rx_packets_per_sec_min, point.net_rx_packets_per_sec_max),
+    netTxPackets: agg(point.net_tx_packets_per_sec_avg, point.net_tx_packets_per_sec_min, point.net_tx_packets_per_sec_max),
+    blkRead: agg(point.blk_read_bytes_per_sec_avg, point.blk_read_bytes_per_sec_min, point.blk_read_bytes_per_sec_max),
+    blkWrite: agg(point.blk_write_bytes_per_sec_avg, point.blk_write_bytes_per_sec_min, point.blk_write_bytes_per_sec_max),
+    pids: agg(point.pids_current_avg, point.pids_current_min, point.pids_current_max),
   };
 }
 
-/** A raw sample as a served point: avg = min = max = the value. */
+/** A raw sample as a served point: avg = min = max = the value.
+ * Cumulative totals are not carried into history (see StatsSample). */
 function pointFromSample(sample: StatsSample): StatsRollupPoint {
   const point = (value: number | null): { avg: number | null; min: number | null; max: number | null } => ({
     avg: value,
@@ -668,6 +794,13 @@ function pointFromSample(sample: StatsSample): StatsRollupPoint {
   const limit = point(sample.limit_bytes);
   const ratio = point(sample.usage_ratio);
   const cpu = point(sample.cpu_percent);
+  const netRx = point(sample.net_rx_bytes_per_sec);
+  const netTx = point(sample.net_tx_bytes_per_sec);
+  const netRxPackets = point(sample.net_rx_packets_per_sec);
+  const netTxPackets = point(sample.net_tx_packets_per_sec);
+  const blkRead = point(sample.blk_read_bytes_per_sec);
+  const blkWrite = point(sample.blk_write_bytes_per_sec);
+  const pids = point(sample.pids_current);
   return {
     ts: sample.ts,
     resolution_ms: RAW_TIER.windowMs,
@@ -696,6 +829,27 @@ function pointFromSample(sample: StatsSample): StatsRollupPoint {
     cpu_avg: cpu.avg,
     cpu_min: cpu.min,
     cpu_max: cpu.max,
+    net_rx_bytes_per_sec_avg: netRx.avg,
+    net_rx_bytes_per_sec_min: netRx.min,
+    net_rx_bytes_per_sec_max: netRx.max,
+    net_tx_bytes_per_sec_avg: netTx.avg,
+    net_tx_bytes_per_sec_min: netTx.min,
+    net_tx_bytes_per_sec_max: netTx.max,
+    net_rx_packets_per_sec_avg: netRxPackets.avg,
+    net_rx_packets_per_sec_min: netRxPackets.min,
+    net_rx_packets_per_sec_max: netRxPackets.max,
+    net_tx_packets_per_sec_avg: netTxPackets.avg,
+    net_tx_packets_per_sec_min: netTxPackets.min,
+    net_tx_packets_per_sec_max: netTxPackets.max,
+    blk_read_bytes_per_sec_avg: blkRead.avg,
+    blk_read_bytes_per_sec_min: blkRead.min,
+    blk_read_bytes_per_sec_max: blkRead.max,
+    blk_write_bytes_per_sec_avg: blkWrite.avg,
+    blk_write_bytes_per_sec_min: blkWrite.min,
+    blk_write_bytes_per_sec_max: blkWrite.max,
+    pids_current_avg: pids.avg,
+    pids_current_min: pids.min,
+    pids_current_max: pids.max,
   };
 }
 
@@ -1066,6 +1220,76 @@ function pruneStatsData(): void {
 }
 
 /**
+ * Network counters summed across interfaces, the way `docker stats` sums
+ * NET I/O. Null when Docker reports no `networks` object (or no
+ * interfaces) — a missing field is a gap, never a zero.
+ */
+function networkCounters(s: DockerStatsResponse): {
+  rxBytes: number | null;
+  txBytes: number | null;
+  rxPackets: number | null;
+  txPackets: number | null;
+} | null {
+  const networks = s.networks;
+  if (!networks || typeof networks !== "object") return null;
+  const ifaces = Object.values(networks);
+  if (ifaces.length === 0) return null;
+  const sum = (pick: (i: NonNullable<DockerStatsResponse["networks"]>[string]) => number | undefined): number | null => {
+    let total = 0;
+    let seen = false;
+    for (const iface of ifaces) {
+      const v = pick(iface);
+      if (typeof v === "number" && Number.isFinite(v)) {
+        total += v;
+        seen = true;
+      }
+    }
+    return seen ? total : null;
+  };
+  return {
+    rxBytes: sum((i) => i.rx_bytes),
+    txBytes: sum((i) => i.tx_bytes),
+    rxPackets: sum((i) => i.rx_packets),
+    txPackets: sum((i) => i.tx_packets),
+  };
+}
+
+/**
+ * Block I/O totals from `io_service_bytes_recursive`: sum the `Read` and
+ * `Write` ops only — `Total`/`Sync`/`Async`/`Discard` would double-count
+ * the same bytes. Null per direction when that op is absent; null overall
+ * when the array is missing or empty.
+ */
+function blkioCounters(s: DockerStatsResponse): {
+  readBytes: number | null;
+  writeBytes: number | null;
+} | null {
+  const entries = s.blkio_stats?.io_service_bytes_recursive;
+  if (!Array.isArray(entries) || entries.length === 0) return null;
+  const sumOp = (op: string): number | null => {
+    let total = 0;
+    let seen = false;
+    for (const e of entries) {
+      if (e?.op === op && typeof e.value === "number" && Number.isFinite(e.value)) {
+        total += e.value;
+        seen = true;
+      }
+    }
+    return seen ? total : null;
+  };
+  return { readBytes: sumOp("Read"), writeBytes: sumOp("Write") };
+}
+
+/** Per-second rate from two cumulative counter readings. Null on a missing
+ * reading, a non-positive interval, or a counter reset (current < previous,
+ * e.g. container recreate) — a reset must never surface as a negative spike. */
+function counterRate(prev: number | null, curr: number | null, dtMs: number): number | null {
+  if (prev === null || curr === null || dtMs <= 0) return null;
+  if (curr < prev) return null;
+  return (curr - prev) / (dtMs / 1000);
+}
+
+/**
  * Compute the `docker stats`-style CPU percentage. Returns null when we
  * don't have both a current and prior CPU sample (first poll after startup)
  * or when totals are unset — treating those as null is what `docker stats`
@@ -1161,7 +1385,18 @@ async function pollStatsOnce(): Promise<void> {
       // container consistently.
       const usageRatio = IS_UNLIMITED(limit) ? null : workingSet / (limit as number);
       const cpuPercent = calcCpuPercent(body);
+      const onlineCpus = body.cpu_stats?.online_cpus;
+      if (typeof onlineCpus === "number" && onlineCpus > 0) hostCpuCount = onlineCpus;
 
+      // Network / block I/O rates from cumulative counters. The interval
+      // is the delta between Docker `read` timestamps (the samples'
+      // own clock), falling back to wall-clock now when unparseable.
+      const readMs = Date.parse(body.read ?? "");
+      const readNow = Number.isFinite(readMs) ? readMs : Date.now();
+      const net = networkCounters(body);
+      const blk = blkioCounters(body);
+      const prev = prevCounters[name] ?? null;
+      const dtMs = prev === null ? 0 : readNow - prev.readMs;
       const sample: StatsSample = {
         ts: body.read ?? new Date().toISOString(),
         usage_bytes: usage,
@@ -1172,7 +1407,30 @@ async function pollStatsOnce(): Promise<void> {
         limit_bytes: limit,
         usage_ratio: usageRatio,
         cpu_percent: cpuPercent,
-        resolution_ms: STATS_TIERS[0].windowMs,
+        net_rx_bytes_per_sec: counterRate(prev?.netRx ?? null, net?.rxBytes ?? null, dtMs),
+        net_tx_bytes_per_sec: counterRate(prev?.netTx ?? null, net?.txBytes ?? null, dtMs),
+        net_rx_packets_per_sec: counterRate(prev?.netRxPackets ?? null, net?.rxPackets ?? null, dtMs),
+        net_tx_packets_per_sec: counterRate(prev?.netTxPackets ?? null, net?.txPackets ?? null, dtMs),
+        net_rx_bytes_total: net?.rxBytes ?? null,
+        net_tx_bytes_total: net?.txBytes ?? null,
+        blk_read_bytes_per_sec: counterRate(prev?.blkRead ?? null, blk?.readBytes ?? null, dtMs),
+        blk_write_bytes_per_sec: counterRate(prev?.blkWrite ?? null, blk?.writeBytes ?? null, dtMs),
+        blk_read_bytes_total: blk?.readBytes ?? null,
+        blk_write_bytes_total: blk?.writeBytes ?? null,
+        pids_current:
+          typeof body.pids_stats?.current === "number" ? body.pids_stats.current : null,
+        // Raw samples are 1s points. (Previously this read the 10s tier's
+        // window, mislabeling every stored raw sample's resolution.)
+        resolution_ms: RAW_TIER.windowMs,
+      };
+      prevCounters[name] = {
+        readMs: readNow,
+        netRx: net?.rxBytes ?? null,
+        netTx: net?.txBytes ?? null,
+        netRxPackets: net?.rxPackets ?? null,
+        netTxPackets: net?.txPackets ?? null,
+        blkRead: blk?.readBytes ?? null,
+        blkWrite: blk?.writeBytes ?? null,
       };
 
       ingestSample(name, sample);
@@ -1686,6 +1944,23 @@ async function handleRequest(
     return;
   }
 
+  // GET /stats — latest sample per monitored container, for the
+  // dashboard overview (donuts). No history, no Docker calls: the
+  // samples are the in-memory latest from the 1s poll. Containers with
+  // no sample yet report `latest: null`.
+  if (pathname === "/stats" && req.method === "GET") {
+    sendJson(res, 200, {
+      containers: targets.map((container) => ({
+        container,
+        latest: latestSample[container] ?? null,
+      })),
+      host_cpus: hostCpuCount,
+      poll_interval_ms: STATS_POLL_INTERVAL_MS,
+      pressure_threshold_ratio: MEMORY_PRESSURE_RATIO,
+    });
+    return;
+  }
+
   // GET /stats/:container — restricted to monitored containers
   const statsMatch = /^\/stats\/([^/]+)$/.exec(pathname);
   if (statsMatch && req.method === "GET") {
@@ -1707,6 +1982,7 @@ async function handleRequest(
       container,
       poll_interval_ms: STATS_POLL_INTERVAL_MS,
       pressure_threshold_ratio: MEMORY_PRESSURE_RATIO,
+      host_cpus: hostCpuCount,
       latest: latestSample[container] ?? null,
       history: points,
       span_s: spanS,
