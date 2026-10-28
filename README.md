@@ -19,6 +19,8 @@ pm2 start ecosystem.config.js
 pm2 save
 ```
 
+`ecosystem.config.js` loads `.env` itself (no `source .env` step, no extra dependency) — pm2 never reads `.env` on its own. A variable set in the shell wins over `.env`. After editing `.env`, restart by naming the config file so it is re-read: `pm2 restart ecosystem.config.js`, then `pm2 save`. A restart by process name (`pm2 restart monitor`) does not re-read `.env`, and neither does a reboot resurrect until the next config-file restart. Two variables the app reads directly — `STATS_DATA_DIR` and `JOURNALCTL_TIMEOUT_MS` — apply on a fresh start; to refresh them after an edit, restart the pm2 daemon (`pm2 kill`, then `pm2 start ecosystem.config.js`) or export them in the shell and restart with `--update-env`.
+
 No install step needed — `monitor.js` is plain Node.js with no dependencies.
 
 ## Log source: systemd-journald
@@ -97,7 +99,7 @@ The token itself is never stored in the browser: the page sends it once in the l
 
 ## Building
 
-Write code in `src/monitor.ts`, then compile it to `monitor.js` and commit both. `monitor.js` is the only thing pm2 runs — there is no build step on the server; deploy is `git pull` + `pm2 restart monitor`. `frontend.html` ships in the repo next to `monitor.js` and is read from disk per request, so a pull updates the dashboard with no restart.
+Write code in `src/monitor.ts`, then compile it to `monitor.js` and commit both. `monitor.js` is the only thing pm2 runs — there is no build step on the server; deploy is `git pull`, then with the config file (so `.env` is re-read) `pm2 restart ecosystem.config.js`, then `pm2 save`. `frontend.html` ships in the repo next to `monitor.js` and is read from disk per request, so a pull updates the dashboard with no restart.
 
 ```bash
 # TypeScript and the Node type declarations are build-time tools only
@@ -116,6 +118,8 @@ Stats are polled from the Docker socket (`/containers/{name}/stats?stream=false`
 Retention is tiered and cascading: every 1s sample feeds the 10s buckets, each finalized bucket feeds the next tier up, and every tier keeps the average, min, and max per metric over its window (a 1min point aggregates six 10s points via two 30s points — count-weighted, so the average is exact, and min-of-mins / max-of-maxes are exact too). Raw 1s samples are kept for `STATS_RAW_RETENTION_DAYS` (default 30); rollups are kept longer — 10s for 90 days, 30s and 1min for 1 year, 1h, 1d, and 1wk for 3 years. Storage is a segmented append-only store under `STATS_DATA_DIR` (default `stats-data/` next to `monitor.js`, gitignored): one JSON-lines file per container per hour (per day for the 1h/1d/1wk tiers), gzipped once the period closes, pruned by a daily sweep. A query reads only the segments overlapping its window, so a 1-minute query reads a single hour-file instead of scanning the retained millions. Measured: ~0.75 GiB gzipped for 7 containers at the default retentions. Open buckets are rebuilt from the tier below on restart, so a restart loses no partial window; a missing or corrupt segment line is skipped, never fatal.
 
 ## Environment Variables
+
+Values come from `.env` (loaded by `ecosystem.config.js`) or from the shell; a variable set in the shell wins over `.env`. See Setup for how `.env` edits take effect.
 
 | Variable | Required | Default | Description |
 |---|---|---|---|
