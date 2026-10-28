@@ -112,7 +112,6 @@
           <option value="10800">3 hours</option>
           <option value="21600">6 hours</option>
           <option value="43200">12 hours</option>
-          <option value="86400">24 hours</option>
           <option value="86400">1 day</option>
           <option value="259200">3 days</option>
           <option value="604800">1 week</option>
@@ -364,20 +363,42 @@ async function loadContainers() {
 
 // Overview donuts: shown when no container is selected, refreshed every
 // second from GET /stats (latest samples only — no history, no Docker
-// calls). Each ring is the containers' share of the total: slices are
-// sized by each container's contribution, the centre shows the total,
-// and the status line carries the usage ratio (CPU vs host capacity,
-// memory vs the summed explicit caps). Containers with no sample yet,
-// or a null value for the metric, contribute 0 and are marked "no data"
-// in the legend.
+// calls). Each ring is sized against its cap, not against the total:
+// CPU against host capacity (100% per host CPU, from `host_cpus`),
+// memory against the summed explicit caps — but only when every
+// monitored container has one; with any uncapped container the cap is
+// undefined and the ring falls back to shares of the total. The
+// unfilled remainder is a muted "Remaining cap" segment, so a 30% total
+// fills 30% of the ring. The centre shows the total, and the status
+// line carries the usage ratio (CPU vs host capacity, memory vs the
+// summed explicit caps). Containers with no sample yet, or a null
+// value for the metric, contribute 0 and are marked "no data" in the
+// legend.
 const SVGNS = "http://www.w3.org/2000/svg";
 
-function renderDonut(el, segments, centerBig, centerSmall) {
+const PLACEHOLDER_COLOR = "#444";
+
+// Appends a muted "Remaining cap" segment when a cap is known and the
+// containers' usage leaves part of it unfilled. When usage meets or
+// exceeds the cap there is no remainder, and the ring falls back to
+// shares of the total (the denominator in renderDonut handles that).
+function withRemainingCap(segments, cap) {
+  if (!cap || cap <= 0) return segments;
+  const total = segments.reduce((s, seg) => s + seg.value, 0);
+  if (cap - total <= 0) return segments;
+  return [...segments, { name: "Remaining cap", color: PLACEHOLDER_COLOR, value: cap - total, hasData: true }];
+}
+
+function renderDonut(el, segments, centerBig, centerSmall, cap) {
   el.replaceChildren();
   const svg = document.createElementNS(SVGNS, "svg");
   svg.setAttribute("viewBox", "0 0 100 100");
   svg.setAttribute("role", "img");
   const total = segments.reduce((s, seg) => s + seg.value, 0);
+  // Denominator is the cap when known (slices sized against capacity,
+  // remainder segment included in `segments`); otherwise the total.
+  // Over-cap usage scales the ring to the total, like the old shares.
+  const denom = cap && cap > 0 ? Math.max(cap, total) : total;
   const bg = document.createElementNS(SVGNS, "circle");
   bg.setAttribute("cx", "50");
   bg.setAttribute("cy", "50");
@@ -388,8 +409,8 @@ function renderDonut(el, segments, centerBig, centerSmall) {
   svg.appendChild(bg);
   let offset = 0;
   for (const seg of segments) {
-    if (total <= 0 || seg.value <= 0) continue;
-    const pct = (seg.value / total) * 100;
+    if (denom <= 0 || seg.value <= 0) continue;
+    const pct = (seg.value / denom) * 100;
     const arc = document.createElementNS(SVGNS, "circle");
     arc.setAttribute("cx", "50");
     arc.setAttribute("cy", "50");
@@ -414,9 +435,10 @@ function renderDonut(el, segments, centerBig, centerSmall) {
   el.appendChild(center);
 }
 
-function renderDonutLegend(listEl, segments, formatValue) {
+function renderDonutLegend(listEl, segments, formatValue, cap) {
   listEl.replaceChildren();
   const total = segments.reduce((s, seg) => s + seg.value, 0);
+  const denom = cap && cap > 0 ? Math.max(cap, total) : total;
   for (const seg of segments) {
     const li = document.createElement("li");
     const swatch = document.createElement("span");
@@ -424,7 +446,7 @@ function renderDonutLegend(listEl, segments, formatValue) {
     swatch.style.background = seg.color;
     li.appendChild(swatch);
     li.appendChild(Object.assign(text("span", seg.name), { className: "lname" }));
-    const share = total > 0 && seg.value > 0 ? ` · ${((seg.value / total) * 100).toFixed(0)}%` : "";
+    const share = denom > 0 && seg.value > 0 ? ` · ${((seg.value / denom) * 100).toFixed(0)}%` : "";
     li.appendChild(Object.assign(text("span", seg.hasData ? `${formatValue(seg.value)}${share}` : "no data"), { className: "lval" }));
     listEl.appendChild(li);
   }
@@ -457,9 +479,10 @@ async function loadOverview() {
     }));
     const cpuTotal = cpuSegments.reduce((s, seg) => s + seg.value, 0);
     const hostCpus = data.host_cpus;
+    const cpuCap = hostCpus ? 100 * hostCpus : null;
     const cpuSmall = hostCpus ? `${fmtPct(cpuTotal / (100 * hostCpus))} of host` : "host CPUs unknown";
-    renderDonut(cpuDonutEl, cpuSegments, `${cpuTotal.toFixed(1)}%`, cpuSmall);
-    renderDonutLegend(cpuDonutLegend, cpuSegments, (v) => `${v.toFixed(1)}%`);
+    renderDonut(cpuDonutEl, withRemainingCap(cpuSegments, cpuCap), `${cpuTotal.toFixed(1)}%`, cpuSmall, cpuCap);
+    renderDonutLegend(cpuDonutLegend, withRemainingCap(cpuSegments, cpuCap), (v) => `${v.toFixed(1)}%`, cpuCap);
 
     const memSegments = entries.map((e) => ({
       name: e.name,
@@ -471,9 +494,13 @@ async function loadOverview() {
     const capped = entries.filter((e) => e.latest && e.latest.usage_ratio !== null && e.latest.usage_ratio !== undefined && e.latest.limit_bytes);
     const capLimit = capped.reduce((s, e) => s + e.latest.limit_bytes, 0);
     const capUsed = capped.reduce((s, e) => s + e.latest.working_set_bytes, 0);
+    // The memory cap is well-defined only when every container has an
+    // explicit cap; with any uncapped container the summed limits would
+    // count host RAM once per container, so no placeholder is shown.
+    const memCap = capped.length === entries.length && entries.length > 0 ? capLimit : null;
     const memSmall = capped.length ? `${fmtPct(capUsed / capLimit)} of caps` : "no caps";
-    renderDonut(memDonutEl, memSegments, fmtBytes(memTotal), memSmall);
-    renderDonutLegend(memDonutLegend, memSegments, fmtBytes);
+    renderDonut(memDonutEl, withRemainingCap(memSegments, memCap), fmtBytes(memTotal), memSmall, memCap);
+    renderDonutLegend(memDonutLegend, withRemainingCap(memSegments, memCap), fmtBytes, memCap);
     const hostNote = hostCpus ? ` · ${hostCpus} CPU${hostCpus === 1 ? "" : "s"}` : "";
     const capNote = ` · ${capped.length}/${entries.length} capped`;
     overviewStatus.textContent = `Updated ${new Date().toLocaleTimeString()} · every 1s${hostNote}${capNote}`;
