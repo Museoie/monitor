@@ -82,6 +82,13 @@
         </select>
       </label>
       <label>End <input id="endInput" type="datetime-local" title="Empty = now (live)"> </label>
+      <label>Line
+        <select id="lineSelect" title="Which per-window statistic the chart line shows; the shaded band always spans min–max">
+          <option value="avg" selected>Average</option>
+          <option value="min">Min</option>
+          <option value="max">Max</option>
+        </select>
+      </label>
     </div>
     <dl id="stats"></dl>
     <p id="statsStatus" class="muted"></p>
@@ -126,7 +133,7 @@ const detailView = $("detailView"), detailTitle = $("detailTitle");
 const statsEl = $("stats"), statsStatus = $("statsStatus");
 const logsEl = $("logs"), logsStatus = $("logsStatus");
 const tailSelect = $("tailSelect"), sinceInput = $("sinceInput");
-const spanSelect = $("spanSelect"), endInput = $("endInput");
+const spanSelect = $("spanSelect"), endInput = $("endInput"), lineSelect = $("lineSelect");
 const cpuChart = $("cpuChart"), memChart = $("memChart");
 const cpuLegend = $("cpuLegend"), memLegend = $("memLegend");
 
@@ -347,7 +354,7 @@ function drawCharts() {
   const timeOk = times.length > 1 && times.every((t) => Number.isFinite(t));
   const spanMs = timeOk ? times[times.length - 1] - times[0] : 0;
   const span = spanMs > 0 ? ` · last ${fmtSpan(spanMs)}` : "";
-  const res = ` · ${fmtResolution(lastStats.resolution_ms)} points`;
+  const res = ` · ${fmtResolution(lastStats.resolution_ms)} ${lineSelect.value} points`;
   const fmtTime = (ts) => {
     const d = new Date(ts);
     return isNaN(d) ? "" : d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
@@ -355,7 +362,7 @@ function drawCharts() {
   const t0 = history.length ? fmtTime(history[0].ts) : "";
   const t1 = history.length ? fmtTime(history[history.length - 1].ts) : "";
   const nonNull = (arr) => arr.filter((v) => v !== null && v !== undefined);
-  const cpuVals = history.map((s) => s.cpu_avg);
+  const cpuVals = history.map((s) => s[`cpu_${lineSelect.value}`]);
   const cpuNums = nonNull(cpuVals);
   const cpuMaxes = nonNull(history.map((s) => s.cpu_max));
   if (cpuNums.length < 2) {
@@ -365,7 +372,7 @@ function drawCharts() {
     cpuLegend.textContent = `last ${cpuNums[cpuNums.length - 1].toFixed(1)}% · max ${Math.max(...cpuMaxes).toFixed(1)}% · ${history.length} samples${span}${res}`;
     drawChart(cpuChart, cpuVals, history.map((s) => s.cpu_min), history.map((s) => s.cpu_max), timeOk ? times : null, { color: "#6aa9ff", format: (v) => v.toFixed(0) + "%", t0, t1 });
   }
-  const memVals = history.map((s) => s.working_set_avg);
+  const memVals = history.map((s) => s[`working_set_${lineSelect.value}`]);
   const memNums = nonNull(memVals);
   const memMaxes = nonNull(history.map((s) => s.working_set_max));
   const latest = lastStats.latest;
@@ -507,6 +514,7 @@ $("refreshBtn").addEventListener("click", () => {
 $("logsBtn").addEventListener("click", () => void loadLogs());
 spanSelect.addEventListener("change", () => void loadStats());
 endInput.addEventListener("change", () => void loadStats());
+lineSelect.addEventListener("change", () => drawCharts());
 
 // On load: a valid session cookie takes us straight to the dashboard,
 // otherwise the API 401s and we land on the login form.
