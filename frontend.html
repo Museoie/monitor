@@ -6,7 +6,7 @@
 <title>Monitor</title>
 <style>
   :root { color-scheme: dark; }
-  body { font-family: system-ui, -apple-system, sans-serif; margin: 0 auto; max-width: 960px; padding: 1rem; background: #111; color: #eee; }
+  body { font-family: system-ui, -apple-system, sans-serif; margin: 0 auto; max-width: 1400px; padding: 1rem; background: #111; color: #eee; }
   header { display: flex; align-items: center; justify-content: space-between; }
   h1 { font-size: 1.4rem; margin: 0.5rem 0; }
   h2 { font-size: 1.1rem; margin: 1.2rem 0 0.4rem; }
@@ -30,12 +30,27 @@
   pre { background: #000; border: 1px solid #333; border-radius: 8px; padding: 0.7rem; overflow: auto; max-height: 60vh; white-space: pre-wrap; word-break: break-word; font-size: 0.85rem; }
   .muted { color: #999; font-size: 0.85rem; }
   .charts { display: grid; grid-template-columns: 1fr 1fr; gap: 0.7rem; margin: 0.5rem 0; }
-  .chart { background: #1c1c1c; border: 1px solid #333; border-radius: 8px; padding: 0.7rem; }
+  .chart { background: #1c1c1c; border: 1px solid #333; border-radius: 8px; padding: 0.7rem; position: relative; }
   .chart h4 { margin: 0 0 0.4rem; font-size: 0.95rem; }
   .chart canvas { width: 100%; height: 140px; display: block; }
   .chart .legend { color: #bbb; font-size: 0.8rem; margin-top: 0.3rem; }
+  .tooltip { position: absolute; z-index: 2; background: #000; border: 1px solid #555; border-radius: 6px; padding: 0.4rem 0.6rem; font-size: 0.8rem; line-height: 1.45; white-space: pre-wrap; pointer-events: none; max-width: 320px; }
+  .donuts { display: grid; grid-template-columns: 1fr 1fr; gap: 0.7rem; margin: 0.5rem 0; }
+  .donut-card { background: #1c1c1c; border: 1px solid #333; border-radius: 8px; padding: 0.7rem; }
+  .donut-card h4 { margin: 0 0 0.4rem; font-size: 0.95rem; }
+  .donut-wrap { position: relative; width: 170px; height: 170px; margin: 0.2rem auto; }
+  .donut-wrap svg { width: 100%; height: 100%; display: block; }
+  .donut-center { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; text-align: center; pointer-events: none; }
+  .donut-center .big { font-size: 1.15rem; font-weight: 600; }
+  .donut-center .small { color: #bbb; font-size: 0.75rem; max-width: 110px; }
+  .donut-legend { list-style: none; margin: 0.4rem 0 0; padding: 0; font-size: 0.85rem; }
+  .donut-legend li { display: flex; gap: 0.45rem; align-items: baseline; padding: 0.1rem 0; }
+  .swatch { display: inline-block; width: 0.7em; height: 0.7em; border-radius: 2px; flex: none; }
+  .donut-legend .lname { word-break: break-all; }
+  .donut-legend .lval { margin-left: auto; color: #bbb; white-space: nowrap; }
   @media (max-width: 640px) {
     .charts { grid-template-columns: 1fr; }
+    .donuts { grid-template-columns: 1fr; }
     .cards { display: flex; flex-wrap: nowrap; overflow-x: auto; scroll-snap-type: x proximity; padding-bottom: 0.4rem; -webkit-overflow-scrolling: touch; }
     .cards .card { flex: 0 0 76%; scroll-snap-align: start; }
   }
@@ -62,9 +77,27 @@
   <h2>Containers</h2>
   <div class="row">
     <button id="refreshBtn">Refresh</button>
+    <button id="showAllBtn" hidden>Show all</button>
     <span id="containersStatus" class="muted"></span>
   </div>
   <div id="containers" class="cards"></div>
+
+  <section id="overviewView" hidden>
+    <h3>All containers</h3>
+    <p id="overviewStatus" class="muted"></p>
+    <div class="donuts">
+      <div class="donut-card">
+        <h4>CPU</h4>
+        <div id="cpuDonut" class="donut-wrap"></div>
+        <ul id="cpuDonutLegend" class="donut-legend"></ul>
+      </div>
+      <div class="donut-card">
+        <h4>Memory (working set)</h4>
+        <div id="memDonut" class="donut-wrap"></div>
+        <ul id="memDonutLegend" class="donut-legend"></ul>
+      </div>
+    </div>
+  </section>
 
   <section id="detailView" hidden>
     <h2 id="detailTitle"></h2>
@@ -76,8 +109,18 @@
           <option value="600">10 minutes</option>
           <option value="1800">30 minutes</option>
           <option value="3600" selected>1 hour</option>
+          <option value="10800">3 hours</option>
+          <option value="21600">6 hours</option>
+          <option value="43200">12 hours</option>
+          <option value="86400">24 hours</option>
+          <option value="86400">1 day</option>
           <option value="259200">3 days</option>
-          <option value="7776000">90 days</option>
+          <option value="604800">1 week</option>
+          <option value="1209600">2 weeks</option>
+          <option value="2592000">1 month</option>
+          <option value="7776000">3 months</option>
+          <option value="15552000">6 months</option>
+          <option value="31536000">1 year</option>
           <option value="94608000">3 years</option>
         </select>
       </label>
@@ -97,11 +140,31 @@
         <h4>CPU %</h4>
         <canvas id="cpuChart" height="140"></canvas>
         <div id="cpuLegend" class="legend"></div>
+        <div id="cpuTooltip" class="tooltip" hidden></div>
       </div>
       <div class="chart">
         <h4>Memory (working set)</h4>
         <canvas id="memChart" height="140"></canvas>
         <div id="memLegend" class="legend"></div>
+        <div id="memTooltip" class="tooltip" hidden></div>
+      </div>
+      <div class="chart">
+        <h4>Network I/O</h4>
+        <canvas id="netChart" height="140"></canvas>
+        <div id="netLegend" class="legend"></div>
+        <div id="netTooltip" class="tooltip" hidden></div>
+      </div>
+      <div class="chart">
+        <h4>Block I/O</h4>
+        <canvas id="blkChart" height="140"></canvas>
+        <div id="blkLegend" class="legend"></div>
+        <div id="blkTooltip" class="tooltip" hidden></div>
+      </div>
+      <div class="chart">
+        <h4>PIDs</h4>
+        <canvas id="pidChart" height="140"></canvas>
+        <div id="pidLegend" class="legend"></div>
+        <div id="pidTooltip" class="tooltip" hidden></div>
       </div>
     </div>
     <h3>Logs</h3>
@@ -136,25 +199,71 @@ const tailSelect = $("tailSelect"), sinceInput = $("sinceInput");
 const spanSelect = $("spanSelect"), endInput = $("endInput"), lineSelect = $("lineSelect");
 const cpuChart = $("cpuChart"), memChart = $("memChart");
 const cpuLegend = $("cpuLegend"), memLegend = $("memLegend");
+const netChart = $("netChart"), blkChart = $("blkChart"), pidChart = $("pidChart");
+const netLegend = $("netLegend"), blkLegend = $("blkLegend"), pidLegend = $("pidLegend");
+const cpuTooltip = $("cpuTooltip"), memTooltip = $("memTooltip");
+const netTooltip = $("netTooltip"), blkTooltip = $("blkTooltip"), pidTooltip = $("pidTooltip");
+const overviewView = $("overviewView"), overviewStatus = $("overviewStatus");
+const showAllBtn = $("showAllBtn");
+const cpuDonutEl = $("cpuDonut"), memDonutEl = $("memDonut");
+const cpuDonutLegend = $("cpuDonutLegend"), memDonutLegend = $("memDonutLegend");
 
 let selected = null;
 let autoTimer = null;
+let overviewTimer = null;
 let lastStats = null;
 let statsSeq = 0;
+let overviewSeq = 0;
+// Per-canvas hover/geometry state, keyed by canvas id, filled by drawChart
+// so pointer handlers can find the nearest point without re-deriving the
+// chart geometry. Cleared whenever the data or the view changes.
+const chartStates = new Map();
+const DONUT_COLORS = ["#6aa9ff", "#7ddc7d", "#ffb86b", "#ff8080", "#c792ea", "#4dd0e1", "#f06292", "#aed581"];
 
 function showLogin() {
   loginView.hidden = false;
   appView.hidden = true;
   logoutBtn.hidden = true;
   detailView.hidden = true;
+  overviewView.hidden = true;
   selected = null;
   stopAuto();
+  stopOverview();
 }
 
 function showApp() {
   loginView.hidden = true;
   appView.hidden = false;
   logoutBtn.hidden = false;
+  if (!selected) {
+    overviewView.hidden = false;
+    startOverview();
+  }
+}
+
+function startOverview() {
+  stopOverview();
+  overviewTimer = setInterval(() => void loadOverview(), 1000);
+  void loadOverview();
+}
+
+function stopOverview() {
+  if (overviewTimer !== null) {
+    clearInterval(overviewTimer);
+    overviewTimer = null;
+  }
+}
+
+function deselectContainer() {
+  selected = null;
+  detailView.hidden = true;
+  overviewView.hidden = false;
+  showAllBtn.hidden = true;
+  lastStats = null;
+  clearCharts();
+  document.querySelectorAll(".card").forEach((card) => card.classList.remove("selected"));
+  void loadContainers();
+  startOverview();
 }
 
 function text(tag, value) {
@@ -180,11 +289,19 @@ function fmtBytes(n) {
   if (n >= 1 << 30) return (n / (1 << 30)).toFixed(2) + " GiB";
   if (n >= 1 << 20) return (n / (1 << 20)).toFixed(1) + " MiB";
   if (n >= 1 << 10) return (n / (1 << 10)).toFixed(1) + " KiB";
-  return n + " B";
+  return Math.round(n) + " B";
 }
 
 function fmtPct(ratio) {
   return ratio === null || ratio === undefined ? "—" : (ratio * 100).toFixed(1) + "%";
+}
+
+function fmtRate(n) {
+  return n === null || n === undefined ? "—" : fmtBytes(n) + "/s";
+}
+
+function fmtPktRate(n) {
+  return n === null || n === undefined ? "—" : n.toFixed(1) + " pkt/s";
 }
 
 function fmtTs(ts) {
@@ -234,11 +351,134 @@ async function loadContainers() {
         hEl.className = "meta " + (h === "healthy" || h === "none" ? "ok" : "bad");
         card.appendChild(hEl);
       }
-      card.addEventListener("click", () => selectContainer(c.name));
+      card.addEventListener("click", () => {
+        if (selected === c.name) deselectContainer();
+        else selectContainer(c.name);
+      });
       containersEl.appendChild(card);
     }
   } catch (e) {
     if (e.message !== "Unauthorized") containersStatus.textContent = `Failed to load containers: ${e.message}`;
+  }
+}
+
+// Overview donuts: shown when no container is selected, refreshed every
+// second from GET /stats (latest samples only — no history, no Docker
+// calls). Each ring is the containers' share of the total: slices are
+// sized by each container's contribution, the centre shows the total,
+// and the status line carries the usage ratio (CPU vs host capacity,
+// memory vs the summed explicit caps). Containers with no sample yet,
+// or a null value for the metric, contribute 0 and are marked "no data"
+// in the legend.
+const SVGNS = "http://www.w3.org/2000/svg";
+
+function renderDonut(el, segments, centerBig, centerSmall) {
+  el.replaceChildren();
+  const svg = document.createElementNS(SVGNS, "svg");
+  svg.setAttribute("viewBox", "0 0 100 100");
+  svg.setAttribute("role", "img");
+  const total = segments.reduce((s, seg) => s + seg.value, 0);
+  const bg = document.createElementNS(SVGNS, "circle");
+  bg.setAttribute("cx", "50");
+  bg.setAttribute("cy", "50");
+  bg.setAttribute("r", "40");
+  bg.setAttribute("fill", "none");
+  bg.setAttribute("stroke", "#333");
+  bg.setAttribute("stroke-width", "16");
+  svg.appendChild(bg);
+  let offset = 0;
+  for (const seg of segments) {
+    if (total <= 0 || seg.value <= 0) continue;
+    const pct = (seg.value / total) * 100;
+    const arc = document.createElementNS(SVGNS, "circle");
+    arc.setAttribute("cx", "50");
+    arc.setAttribute("cy", "50");
+    arc.setAttribute("r", "40");
+    arc.setAttribute("fill", "none");
+    arc.setAttribute("stroke", seg.color);
+    arc.setAttribute("stroke-width", "16");
+    arc.setAttribute("pathLength", "100");
+    // A hairline gap between slices; the offset walks the ring clockwise
+    // from the top (rotate -90deg via the transform on the svg group).
+    arc.setAttribute("stroke-dasharray", `${Math.max(pct - 0.6, 0)} 100`);
+    arc.setAttribute("stroke-dashoffset", String(-offset));
+    arc.setAttribute("transform", "rotate(-90 50 50)");
+    svg.appendChild(arc);
+    offset += pct;
+  }
+  el.appendChild(svg);
+  const center = document.createElement("div");
+  center.className = "donut-center";
+  center.appendChild(Object.assign(text("div", centerBig), { className: "big" }));
+  if (centerSmall) center.appendChild(Object.assign(text("div", centerSmall), { className: "small" }));
+  el.appendChild(center);
+}
+
+function renderDonutLegend(listEl, segments, formatValue) {
+  listEl.replaceChildren();
+  const total = segments.reduce((s, seg) => s + seg.value, 0);
+  for (const seg of segments) {
+    const li = document.createElement("li");
+    const swatch = document.createElement("span");
+    swatch.className = "swatch";
+    swatch.style.background = seg.color;
+    li.appendChild(swatch);
+    li.appendChild(Object.assign(text("span", seg.name), { className: "lname" }));
+    const share = total > 0 && seg.value > 0 ? ` · ${((seg.value / total) * 100).toFixed(0)}%` : "";
+    li.appendChild(Object.assign(text("span", seg.hasData ? `${formatValue(seg.value)}${share}` : "no data"), { className: "lval" }));
+    listEl.appendChild(li);
+  }
+}
+
+async function loadOverview() {
+  if (selected || overviewView.hidden) return;
+  const seq = ++overviewSeq;
+  try {
+    const data = await api("/stats").then((r) => r.json());
+    if (seq !== overviewSeq || selected || overviewView.hidden) return;
+    const entries = (data.containers || []).map((c, i) => ({
+      name: c.container,
+      latest: c.latest || null,
+      color: DONUT_COLORS[i % DONUT_COLORS.length],
+    }));
+    if (!entries.length) {
+      overviewStatus.textContent = "No containers monitored.";
+      renderDonut(cpuDonutEl, [], "—", "");
+      renderDonut(memDonutEl, [], "—", "");
+      cpuDonutLegend.replaceChildren();
+      memDonutLegend.replaceChildren();
+      return;
+    }
+    const cpuSegments = entries.map((e) => ({
+      name: e.name,
+      color: e.color,
+      value: e.latest && e.latest.cpu_percent !== null && e.latest.cpu_percent !== undefined ? e.latest.cpu_percent : 0,
+      hasData: !!(e.latest && e.latest.cpu_percent !== null && e.latest.cpu_percent !== undefined),
+    }));
+    const cpuTotal = cpuSegments.reduce((s, seg) => s + seg.value, 0);
+    const hostCpus = data.host_cpus;
+    const cpuSmall = hostCpus ? `${fmtPct(cpuTotal / (100 * hostCpus))} of host` : "host CPUs unknown";
+    renderDonut(cpuDonutEl, cpuSegments, `${cpuTotal.toFixed(1)}%`, cpuSmall);
+    renderDonutLegend(cpuDonutLegend, cpuSegments, (v) => `${v.toFixed(1)}%`);
+
+    const memSegments = entries.map((e) => ({
+      name: e.name,
+      color: e.color,
+      value: e.latest && e.latest.working_set_bytes !== null && e.latest.working_set_bytes !== undefined ? e.latest.working_set_bytes : 0,
+      hasData: !!(e.latest && e.latest.working_set_bytes !== null && e.latest.working_set_bytes !== undefined),
+    }));
+    const memTotal = memSegments.reduce((s, seg) => s + seg.value, 0);
+    const capped = entries.filter((e) => e.latest && e.latest.usage_ratio !== null && e.latest.usage_ratio !== undefined && e.latest.limit_bytes);
+    const capLimit = capped.reduce((s, e) => s + e.latest.limit_bytes, 0);
+    const capUsed = capped.reduce((s, e) => s + e.latest.working_set_bytes, 0);
+    const memSmall = capped.length ? `${fmtPct(capUsed / capLimit)} of caps` : "no caps";
+    renderDonut(memDonutEl, memSegments, fmtBytes(memTotal), memSmall);
+    renderDonutLegend(memDonutLegend, memSegments, fmtBytes);
+    const hostNote = hostCpus ? ` · ${hostCpus} CPU${hostCpus === 1 ? "" : "s"}` : "";
+    const capNote = ` · ${capped.length}/${entries.length} capped`;
+    overviewStatus.textContent = `Updated ${new Date().toLocaleTimeString()} · every 1s${hostNote}${capNote}`;
+  } catch (e) {
+    if (e.message !== "Unauthorized") overviewStatus.textContent = `Failed to load overview: ${e.message}`;
   }
 }
 
@@ -262,7 +502,14 @@ function drawChart(canvas, values, lows, highs, times, opts) {
   const plotW = w - padL - padR, plotH = h - padT - padB;
   const nums = values.filter((v) => v !== null && v !== undefined);
   if (highs) for (const v of highs) if (v !== null && v !== undefined) nums.push(v);
-  if (nums.length < 2) return;
+  if (opts.series2) {
+    for (const v of opts.series2.values) if (v !== null && v !== undefined) nums.push(v);
+    if (opts.series2.highs) for (const v of opts.series2.highs) if (v !== null && v !== undefined) nums.push(v);
+  }
+  if (nums.length < 2) {
+    chartStates.delete(canvas.id);
+    return;
+  }
   let ymax = Math.max(...nums, opts.limit || 0);
   if (ymax <= 0) ymax = 1;
   ymax *= 1.1;
@@ -273,6 +520,7 @@ function drawChart(canvas, values, lows, highs, times, opts) {
     if (!timeSpan) return padL + (i / (values.length - 1)) * plotW;
     return padL + ((times[i] - t0) / (t1 - t0)) * plotW;
   };
+  const xs = values.map((_, i) => x(i));
   const y = (v) => padT + plotH - (v / ymax) * plotH;
   ctx.strokeStyle = "#333";
   ctx.fillStyle = "#999";
@@ -300,46 +548,155 @@ function drawChart(canvas, values, lows, highs, times, opts) {
     ctx.stroke();
     ctx.setLineDash([]);
   }
-  const runs = [];
-  let run = [];
-  for (let i = 0; i < values.length; i++) {
-    const v = values[i];
-    if (v === null || v === undefined) {
-      if (run.length) runs.push(run);
-      run = [];
-    } else {
-      const hi = highs && highs[i] !== null && highs[i] !== undefined ? highs[i] : v;
-      const lo = lows && lows[i] !== null && lows[i] !== undefined ? lows[i] : v;
-      run.push([x(i), y(v), y(hi), y(lo)]);
+  // One series: line through the per-point values, shaded min–max band.
+  const drawSeries = (sValues, sLows, sHighs, color) => {
+    const runs = [];
+    let run = [];
+    for (let i = 0; i < sValues.length; i++) {
+      const v = sValues[i];
+      if (v === null || v === undefined) {
+        if (run.length) runs.push(run);
+        run = [];
+      } else {
+        const hi = sHighs && sHighs[i] !== null && sHighs[i] !== undefined ? sHighs[i] : v;
+        const lo = sLows && sLows[i] !== null && sLows[i] !== undefined ? sLows[i] : v;
+        run.push([xs[i], y(v), y(hi), y(lo)]);
+      }
+    }
+    if (run.length) runs.push(run);
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    for (const r of runs) {
+      ctx.moveTo(r[0][0], r[0][1]);
+      for (let j = 1; j < r.length; j++) ctx.lineTo(r[j][0], r[j][1]);
+    }
+    ctx.stroke();
+    ctx.globalAlpha = 0.15;
+    ctx.fillStyle = color;
+    for (const r of runs) {
+      ctx.beginPath();
+      ctx.moveTo(r[0][0], r[0][2]);
+      for (const [px, , pyHi] of r) ctx.lineTo(px, pyHi);
+      for (let j = r.length - 1; j >= 0; j--) ctx.lineTo(r[j][0], r[j][3]);
+      ctx.closePath();
+      ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+  };
+  // Second series first (behind), so the primary line stays on top.
+  if (opts.series2) drawSeries(opts.series2.values, opts.series2.lows, opts.series2.highs, opts.series2.color);
+  drawSeries(values, lows, highs, opts.color);
+  // Remember the geometry + series for hover: pointer handlers find the
+  // nearest x, then the tooltip reads avg/min/max from these arrays.
+  const series = [{ label: opts.label || "", values, lows, highs, format: opts.format }];
+  if (opts.series2) series.push({ label: opts.series2.label || "", values: opts.series2.values, lows: opts.series2.lows, highs: opts.series2.highs, format: opts.series2.format || opts.format });
+  chartStates.set(canvas.id, { xs, times: times || null, tsStrings: opts.tsStrings || null, series });
+  // Hover: vertical guide + a dot on each series' line at that time.
+  const hover = opts.hoverIndex;
+  if (hover !== null && hover !== undefined && hover >= 0 && hover < values.length) {
+    const hx = xs[hover];
+    ctx.strokeStyle = "#eee";
+    ctx.lineWidth = 1;
+    ctx.setLineDash([3, 3]);
+    ctx.beginPath();
+    ctx.moveTo(hx, padT);
+    ctx.lineTo(hx, padT + plotH);
+    ctx.stroke();
+    ctx.setLineDash([]);
+    for (const [sValues, color] of [[values, opts.color], opts.series2 ? [opts.series2.values, opts.series2.color] : [null, null]]) {
+      if (!sValues) continue;
+      const v = sValues[hover];
+      if (v === null || v === undefined) continue;
+      ctx.beginPath();
+      ctx.arc(hx, y(v), 3.5, 0, Math.PI * 2);
+      ctx.fillStyle = color;
+      ctx.fill();
+      ctx.strokeStyle = "#fff";
+      ctx.lineWidth = 1;
+      ctx.stroke();
     }
   }
-  if (run.length) runs.push(run);
-  ctx.strokeStyle = opts.color;
-  ctx.lineWidth = 1.5;
-  ctx.beginPath();
-  for (const r of runs) {
-    ctx.moveTo(r[0][0], r[0][1]);
-    for (let j = 1; j < r.length; j++) ctx.lineTo(r[j][0], r[j][1]);
-  }
-  ctx.stroke();
-  ctx.globalAlpha = 0.15;
-  ctx.fillStyle = opts.color;
-  for (const r of runs) {
-    ctx.beginPath();
-    ctx.moveTo(r[0][0], r[0][2]);
-    for (const [px, , pyHi] of r) ctx.lineTo(px, pyHi);
-    for (let j = r.length - 1; j >= 0; j--) ctx.lineTo(r[j][0], r[j][3]);
-    ctx.closePath();
-    ctx.fill();
-  }
-  ctx.globalAlpha = 1;
 }
 
 function clearCharts() {
-  for (const [canvas, legend] of [[cpuChart, cpuLegend], [memChart, memLegend]]) {
+  for (const [canvas, legend, tooltip] of [
+    [cpuChart, cpuLegend, cpuTooltip],
+    [memChart, memLegend, memTooltip],
+    [netChart, netLegend, netTooltip],
+    [blkChart, blkLegend, blkTooltip],
+    [pidChart, pidLegend, pidTooltip],
+  ]) {
     canvas.getContext("2d").clearRect(0, 0, canvas.width, canvas.height);
     legend.textContent = "";
+    tooltip.hidden = true;
+    tooltip.replaceChildren();
   }
+  chartStates.clear();
+  hoverByCanvas.clear();
+}
+
+// Hover state per canvas id -> point index (or null). Kept outside
+// chartStates so a redraw can re-apply it, and cleared on new data.
+const hoverByCanvas = new Map();
+
+function fmtHoverValue(v, format) {
+  return v === null || v === undefined ? "—" : format(v);
+}
+
+function updateTooltip(canvas, tooltipEl, index) {
+  const state = chartStates.get(canvas.id);
+  if (!state) {
+    tooltipEl.hidden = true;
+    return;
+  }
+  const ts = state.tsStrings && state.tsStrings[index] ? state.tsStrings[index] : (state.times && Number.isFinite(state.times[index]) ? new Date(state.times[index]).toISOString() : "—");
+  tooltipEl.replaceChildren();
+  tooltipEl.appendChild(text("div", ts));
+  for (const s of state.series) {
+    const line = `${s.label ? s.label + " — " : ""}avg ${fmtHoverValue(s.values[index], s.format)} · min ${fmtHoverValue(s.lows ? s.lows[index] : null, s.format)} · max ${fmtHoverValue(s.highs ? s.highs[index] : null, s.format)}`;
+    tooltipEl.appendChild(text("div", line));
+  }
+  // Follow the point horizontally, clamped inside the chart card.
+  const w = canvas.clientWidth || 0;
+  const left = Math.max(0, Math.min(state.xs[index] + 12, Math.max(0, w - 220)));
+  tooltipEl.style.left = `${left}px`;
+  tooltipEl.style.top = "8px";
+  tooltipEl.hidden = false;
+}
+
+function attachHover(canvas, tooltipEl) {
+  const onMove = (e) => {
+    const state = chartStates.get(canvas.id);
+    if (!state || !state.xs.length) return;
+    const rect = canvas.getBoundingClientRect();
+    const px = e.clientX - rect.left;
+    let best = 0;
+    let bestDist = Infinity;
+    for (let i = 0; i < state.xs.length; i++) {
+      const d = Math.abs(state.xs[i] - px);
+      if (d < bestDist) {
+        bestDist = d;
+        best = i;
+      }
+    }
+    hoverByCanvas.set(canvas.id, best);
+    updateTooltip(canvas, tooltipEl, best);
+    drawCharts();
+  };
+  const onLeave = () => {
+    hoverByCanvas.delete(canvas.id);
+    tooltipEl.hidden = true;
+    drawCharts();
+  };
+  canvas.addEventListener("pointermove", onMove);
+  canvas.addEventListener("pointerleave", onLeave);
+  canvas.addEventListener("pointercancel", onLeave);
+}
+
+function clearHover() {
+  hoverByCanvas.clear();
+  for (const el of [cpuTooltip, memTooltip, netTooltip, blkTooltip, pidTooltip]) el.hidden = true;
 }
 
 function fmtResolution(ms) {
@@ -362,17 +719,21 @@ function drawCharts() {
   const t0 = history.length ? fmtTime(history[0].ts) : "";
   const t1 = history.length ? fmtTime(history[history.length - 1].ts) : "";
   const nonNull = (arr) => arr.filter((v) => v !== null && v !== undefined);
-  const cpuVals = history.map((s) => s[`cpu_${lineSelect.value}`]);
+  const tsStrings = history.map((s) => s.ts);
+  const stat = lineSelect.value;
+  const cpuVals = history.map((s) => s[`cpu_${stat}`]);
   const cpuNums = nonNull(cpuVals);
   const cpuMaxes = nonNull(history.map((s) => s.cpu_max));
   if (cpuNums.length < 2) {
     cpuLegend.textContent = "Not enough samples yet.";
     cpuChart.getContext("2d").clearRect(0, 0, cpuChart.width, cpuChart.height);
+    chartStates.delete(cpuChart.id);
+    cpuTooltip.hidden = true;
   } else {
     cpuLegend.textContent = `last ${cpuNums[cpuNums.length - 1].toFixed(1)}% · max ${Math.max(...cpuMaxes).toFixed(1)}% · ${history.length} samples${span}${res}`;
-    drawChart(cpuChart, cpuVals, history.map((s) => s.cpu_min), history.map((s) => s.cpu_max), timeOk ? times : null, { color: "#6aa9ff", format: (v) => v.toFixed(0) + "%", t0, t1 });
+    drawChart(cpuChart, cpuVals, history.map((s) => s.cpu_min), history.map((s) => s.cpu_max), timeOk ? times : null, { color: "#6aa9ff", format: (v) => v.toFixed(0) + "%", t0, t1, label: "CPU", tsStrings, hoverIndex: hoverByCanvas.get(cpuChart.id) ?? null });
   }
-  const memVals = history.map((s) => s[`working_set_${lineSelect.value}`]);
+  const memVals = history.map((s) => s[`working_set_${stat}`]);
   const memNums = nonNull(memVals);
   const memMaxes = nonNull(history.map((s) => s.working_set_max));
   const latest = lastStats.latest;
@@ -380,15 +741,70 @@ function drawCharts() {
   if (memNums.length < 2) {
     memLegend.textContent = "Not enough samples yet.";
     memChart.getContext("2d").clearRect(0, 0, memChart.width, memChart.height);
+    chartStates.delete(memChart.id);
+    memTooltip.hidden = true;
   } else {
     memLegend.textContent = `last ${fmtBytes(memNums[memNums.length - 1])} · max ${fmtBytes(Math.max(...memMaxes))}${capped ? ` · limit ${fmtBytes(capped)}` : ""} · ${history.length} samples${span}${res}`;
-    drawChart(memChart, memVals, history.map((s) => s.working_set_min), history.map((s) => s.working_set_max), timeOk ? times : null, { color: "#7ddc7d", format: fmtBytes, limit: capped, t0, t1 });
+    drawChart(memChart, memVals, history.map((s) => s.working_set_min), history.map((s) => s.working_set_max), timeOk ? times : null, { color: "#7ddc7d", format: fmtBytes, limit: capped, t0, t1, label: "Memory", tsStrings, hoverIndex: hoverByCanvas.get(memChart.id) ?? null });
+  }
+  // Network + block I/O are rates (bytes/s), drawn as two series each
+  // (RX/TX, read/write) on a shared scale with the Line statistic
+  // selecting which per-window value the lines show.
+  const fmtBps = (v) => fmtBytes(v) + "/s";
+  const rxVals = history.map((s) => s[`net_rx_bytes_per_sec_${stat}`]);
+  const txVals = history.map((s) => s[`net_tx_bytes_per_sec_${stat}`]);
+  const rxNums = nonNull(rxVals);
+  const txNums = nonNull(txVals);
+  if (rxNums.length < 2 && txNums.length < 2) {
+    netLegend.textContent = "Not enough samples yet.";
+    netChart.getContext("2d").clearRect(0, 0, netChart.width, netChart.height);
+    chartStates.delete(netChart.id);
+    netTooltip.hidden = true;
+  } else {
+    const lastRx = rxNums.length ? fmtRate(rxNums[rxNums.length - 1]) : "—";
+    const lastTx = txNums.length ? fmtRate(txNums[txNums.length - 1]) : "—";
+    netLegend.textContent = `RX last ${lastRx} · TX last ${lastTx} · ${history.length} samples${span}${res}`;
+    drawChart(netChart, rxVals, history.map((s) => s.net_rx_bytes_per_sec_min), history.map((s) => s.net_rx_bytes_per_sec_max), timeOk ? times : null, {
+      color: "#6aa9ff", format: fmtBps, t0, t1, label: "RX", tsStrings, hoverIndex: hoverByCanvas.get(netChart.id) ?? null,
+      series2: { values: txVals, lows: history.map((s) => s.net_tx_bytes_per_sec_min), highs: history.map((s) => s.net_tx_bytes_per_sec_max), color: "#ffb86b", label: "TX", format: fmtBps },
+    });
+  }
+  const rdVals = history.map((s) => s[`blk_read_bytes_per_sec_${stat}`]);
+  const wrVals = history.map((s) => s[`blk_write_bytes_per_sec_${stat}`]);
+  const rdNums = nonNull(rdVals);
+  const wrNums = nonNull(wrVals);
+  if (rdNums.length < 2 && wrNums.length < 2) {
+    blkLegend.textContent = "Not enough samples yet.";
+    blkChart.getContext("2d").clearRect(0, 0, blkChart.width, blkChart.height);
+    chartStates.delete(blkChart.id);
+    blkTooltip.hidden = true;
+  } else {
+    const lastRd = rdNums.length ? fmtRate(rdNums[rdNums.length - 1]) : "—";
+    const lastWr = wrNums.length ? fmtRate(wrNums[wrNums.length - 1]) : "—";
+    blkLegend.textContent = `read last ${lastRd} · write last ${lastWr} · ${history.length} samples${span}${res}`;
+    drawChart(blkChart, rdVals, history.map((s) => s.blk_read_bytes_per_sec_min), history.map((s) => s.blk_read_bytes_per_sec_max), timeOk ? times : null, {
+      color: "#7ddc7d", format: fmtBps, t0, t1, label: "Read", tsStrings, hoverIndex: hoverByCanvas.get(blkChart.id) ?? null,
+      series2: { values: wrVals, lows: history.map((s) => s.blk_write_bytes_per_sec_min), highs: history.map((s) => s.blk_write_bytes_per_sec_max), color: "#ff8080", label: "Write", format: fmtBps },
+    });
+  }
+  const pidVals = history.map((s) => s[`pids_current_${stat}`]);
+  const pidNums = nonNull(pidVals);
+  const pidMaxes = nonNull(history.map((s) => s.pids_current_max));
+  if (pidNums.length < 2) {
+    pidLegend.textContent = "Not enough samples yet.";
+    pidChart.getContext("2d").clearRect(0, 0, pidChart.width, pidChart.height);
+    chartStates.delete(pidChart.id);
+    pidTooltip.hidden = true;
+  } else {
+    pidLegend.textContent = `last ${pidNums[pidNums.length - 1]} · max ${Math.max(...pidMaxes)} · ${history.length} samples${span}${res}`;
+    drawChart(pidChart, pidVals, history.map((s) => s.pids_current_min), history.map((s) => s.pids_current_max), timeOk ? times : null, { color: "#c792ea", format: (v) => String(Math.round(v)), t0, t1, label: "PIDs", tsStrings, hoverIndex: hoverByCanvas.get(pidChart.id) ?? null });
   }
 }
 
 let resizeTimer = null;
 window.addEventListener("resize", () => {
   if (resizeTimer !== null) clearTimeout(resizeTimer);
+  clearHover();
   resizeTimer = setTimeout(drawCharts, 150);
 });
 
@@ -407,6 +823,10 @@ async function loadStats() {
     if (seq !== statsSeq) return; // a newer window request superseded this one
     const latest = data.latest;
     statsEl.replaceChildren();
+    const ioRow = (rate, total) => {
+      if (!latest) return "—";
+      return `${fmtRate(rate)} · ${fmtBytes(total)} total`;
+    };
     const rows = [
       ["Latest sample", latest ? fmtTs(latest.ts) : "no samples yet"],
       ["Memory (working set)", latest ? fmtBytes(latest.working_set_bytes) : "—"],
@@ -414,6 +834,12 @@ async function loadStats() {
       ["Memory limit", latest ? fmtBytes(latest.limit_bytes) : "— (no cap)"],
       ["Memory ratio", latest ? fmtPct(latest.usage_ratio) : "—"],
       ["CPU", latest && latest.cpu_percent !== null ? latest.cpu_percent.toFixed(1) + "%" : "—"],
+      ["Network RX", ioRow(latest ? latest.net_rx_bytes_per_sec : null, latest ? latest.net_rx_bytes_total : null)],
+      ["Network TX", ioRow(latest ? latest.net_tx_bytes_per_sec : null, latest ? latest.net_tx_bytes_total : null)],
+      ["Network packets", latest ? `${fmtPktRate(latest.net_rx_packets_per_sec)} RX · ${fmtPktRate(latest.net_tx_packets_per_sec)} TX` : "—"],
+      ["Block read", ioRow(latest ? latest.blk_read_bytes_per_sec : null, latest ? latest.blk_read_bytes_total : null)],
+      ["Block write", ioRow(latest ? latest.blk_write_bytes_per_sec : null, latest ? latest.blk_write_bytes_total : null)],
+      ["PIDs", latest && latest.pids_current !== null ? String(latest.pids_current) : "—"],
       ["Points in view", String((data.history || []).length)],
     ];
     for (const [k, v] of rows) {
@@ -422,6 +848,7 @@ async function loadStats() {
     }
     statsStatus.textContent = `Poll interval ${data.poll_interval_ms}ms · pressure threshold ${Math.round((data.pressure_threshold_ratio || 0) * 100)}% · ${fmtResolution(data.resolution_ms)} points`;
     lastStats = data;
+    clearHover();
     drawCharts();
   } catch (e) {
     if (e.message !== "Unauthorized") statsStatus.textContent = `Failed to load stats: ${e.message}`;
@@ -447,6 +874,9 @@ function selectContainer(name) {
   selected = name;
   detailTitle.textContent = name;
   detailView.hidden = false;
+  overviewView.hidden = true;
+  showAllBtn.hidden = false;
+  stopOverview();
   lastStats = null;
   clearCharts();
   document.querySelectorAll(".card").forEach((card) => {
@@ -509,12 +939,20 @@ $("refreshBtn").addEventListener("click", () => {
   if (selected) {
     void loadStats();
     void loadLogs();
+  } else {
+    void loadOverview();
   }
 });
+showAllBtn.addEventListener("click", () => deselectContainer());
 $("logsBtn").addEventListener("click", () => void loadLogs());
 spanSelect.addEventListener("change", () => void loadStats());
 endInput.addEventListener("change", () => void loadStats());
 lineSelect.addEventListener("change", () => drawCharts());
+attachHover(cpuChart, cpuTooltip);
+attachHover(memChart, memTooltip);
+attachHover(netChart, netTooltip);
+attachHover(blkChart, blkTooltip);
+attachHover(pidChart, pidTooltip);
 
 // On load: a valid session cookie takes us straight to the dashboard,
 // otherwise the API 401s and we land on the login form.
