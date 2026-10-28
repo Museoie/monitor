@@ -112,7 +112,6 @@
           <option value="10800">3 hours</option>
           <option value="21600">6 hours</option>
           <option value="43200">12 hours</option>
-          <option value="86400">24 hours</option>
           <option value="86400">1 day</option>
           <option value="259200">3 days</option>
           <option value="604800">1 week</option>
@@ -364,27 +363,46 @@ async function loadContainers() {
 
 // Overview donuts: shown when no container is selected, refreshed every
 // second from GET /stats (latest samples only — no history, no Docker
-// calls). Each ring is the containers' share of the total: slices are
-// sized by each container's contribution, the centre shows the total,
-// and the status line carries the usage ratio (CPU vs host capacity,
-// memory vs the summed explicit caps). Containers with no sample yet,
-// or a null value for the metric, contribute 0 and are marked "no data"
-// in the legend.
+// calls). Slices are sized by each container's share of the total, as
+// before; what changes with load is the ring's THICKNESS, which encodes
+// total usage / cap — full thickness at or above the cap, thinner
+// below it, over a grey track ring at full thickness underneath. CPU
+// capacity is host capacity (100% per host CPU, from `host_cpus`);
+// memory capacity is the summed explicit caps, but only when every
+// monitored container has one; with any uncapped container the cap is
+// undefined and the ring stays at full thickness. The centre shows the
+// total, and the status line carries the usage ratio (CPU vs host
+// capacity, memory vs the summed explicit caps). Containers with no
+// sample yet, or a null value for the metric, contribute 0 and are
+// marked "no data" in the legend.
 const SVGNS = "http://www.w3.org/2000/svg";
 
-function renderDonut(el, segments, centerBig, centerSmall) {
+// Ring thickness, in viewBox units. The donut renders at 170px (see
+// .donut-wrap), so 1 unit = 1.7px: the track and the full-thickness
+// ring are ~32px, the thinnest ring ~3px. Thickness scales linearly
+// with total usage / cap (25% of cap -> ~8px), floored so a small but
+// nonzero usage stays visible.
+const TRACK_THICKNESS = 18.8;
+const MIN_THICKNESS = 1.8;
+function donutThickness(ratio, total) {
+  if (ratio === null || ratio === undefined || total <= 0) return TRACK_THICKNESS;
+  return Math.min(TRACK_THICKNESS, Math.max(MIN_THICKNESS, ratio * TRACK_THICKNESS));
+}
+
+function renderDonut(el, segments, centerBig, centerSmall, ratio) {
   el.replaceChildren();
   const svg = document.createElementNS(SVGNS, "svg");
   svg.setAttribute("viewBox", "0 0 100 100");
   svg.setAttribute("role", "img");
   const total = segments.reduce((s, seg) => s + seg.value, 0);
+  const thickness = donutThickness(ratio, total);
   const bg = document.createElementNS(SVGNS, "circle");
   bg.setAttribute("cx", "50");
   bg.setAttribute("cy", "50");
   bg.setAttribute("r", "40");
   bg.setAttribute("fill", "none");
   bg.setAttribute("stroke", "#333");
-  bg.setAttribute("stroke-width", "16");
+  bg.setAttribute("stroke-width", String(TRACK_THICKNESS));
   svg.appendChild(bg);
   let offset = 0;
   for (const seg of segments) {
@@ -396,7 +414,7 @@ function renderDonut(el, segments, centerBig, centerSmall) {
     arc.setAttribute("r", "40");
     arc.setAttribute("fill", "none");
     arc.setAttribute("stroke", seg.color);
-    arc.setAttribute("stroke-width", "16");
+    arc.setAttribute("stroke-width", String(thickness));
     arc.setAttribute("pathLength", "100");
     // A hairline gap between slices; the offset walks the ring clockwise
     // from the top (rotate -90deg via the transform on the svg group).
@@ -457,8 +475,9 @@ async function loadOverview() {
     }));
     const cpuTotal = cpuSegments.reduce((s, seg) => s + seg.value, 0);
     const hostCpus = data.host_cpus;
-    const cpuSmall = hostCpus ? `${fmtPct(cpuTotal / (100 * hostCpus))} of host` : "host CPUs unknown";
-    renderDonut(cpuDonutEl, cpuSegments, `${cpuTotal.toFixed(1)}%`, cpuSmall);
+    const cpuRatio = hostCpus ? cpuTotal / (100 * hostCpus) : null;
+    const cpuSmall = hostCpus ? `${fmtPct(cpuRatio)} of host` : "host CPUs unknown";
+    renderDonut(cpuDonutEl, cpuSegments, `${cpuTotal.toFixed(1)}%`, cpuSmall, cpuRatio);
     renderDonutLegend(cpuDonutLegend, cpuSegments, (v) => `${v.toFixed(1)}%`);
 
     const memSegments = entries.map((e) => ({
@@ -471,8 +490,14 @@ async function loadOverview() {
     const capped = entries.filter((e) => e.latest && e.latest.usage_ratio !== null && e.latest.usage_ratio !== undefined && e.latest.limit_bytes);
     const capLimit = capped.reduce((s, e) => s + e.latest.limit_bytes, 0);
     const capUsed = capped.reduce((s, e) => s + e.latest.working_set_bytes, 0);
+    // The memory cap is well-defined only when every container has an
+    // explicit cap; with any uncapped container the summed limits would
+    // count host RAM once per container, so the ratio is unknown and
+    // the ring stays at full thickness.
+    const memCap = capped.length === entries.length && entries.length > 0 ? capLimit : null;
+    const memRatio = memCap ? memTotal / memCap : null;
     const memSmall = capped.length ? `${fmtPct(capUsed / capLimit)} of caps` : "no caps";
-    renderDonut(memDonutEl, memSegments, fmtBytes(memTotal), memSmall);
+    renderDonut(memDonutEl, memSegments, fmtBytes(memTotal), memSmall, memRatio);
     renderDonutLegend(memDonutLegend, memSegments, fmtBytes);
     const hostNote = hostCpus ? ` · ${hostCpus} CPU${hostCpus === 1 ? "" : "s"}` : "";
     const capNote = ` · ${capped.length}/${entries.length} capped`;

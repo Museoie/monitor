@@ -349,15 +349,20 @@ async function pollHealth() {
     }
 }
 const STATS_TIERS = [
+    // The 10s/30s tiers are rollup steps feeding 1min; no query reads
+    // them directly (raw covers spans up to 30m, 1min covers up to 1d).
     { windowMs: 10_000, label: "10s", key: "t10s", retentionDays: 90, fileSpanMs: 3_600_000, maxSpanMs: 600_000 },
     { windowMs: 30_000, label: "30s", key: "t30s", retentionDays: 365, fileSpanMs: 3_600_000, maxSpanMs: 1_800_000 },
-    { windowMs: 60_000, label: "1min", key: "t1m", retentionDays: 365, fileSpanMs: 3_600_000, maxSpanMs: 3_600_000 },
-    { windowMs: 3_600_000, label: "1h", key: "t1h", retentionDays: 1095, fileSpanMs: 86_400_000, maxSpanMs: 259_200_000 },
-    { windowMs: 86_400_000, label: "1d", key: "t1d", retentionDays: 1095, fileSpanMs: 86_400_000, maxSpanMs: 7_776_000_000 },
+    // Tier thresholds are chosen so every picker window yields at least
+    // ~60 points: 1s points to 30m, 1min points to 1d, 1h points to
+    // 30d, 1d points to 1y, 1wk beyond that.
+    { windowMs: 60_000, label: "1min", key: "t1m", retentionDays: 365, fileSpanMs: 3_600_000, maxSpanMs: 86_400_000 },
+    { windowMs: 3_600_000, label: "1h", key: "t1h", retentionDays: 1095, fileSpanMs: 86_400_000, maxSpanMs: 2_592_000_000 },
+    { windowMs: 86_400_000, label: "1d", key: "t1d", retentionDays: 1095, fileSpanMs: 86_400_000, maxSpanMs: 31_536_000_000 },
     { windowMs: 604_800_000, label: "1wk", key: "t1w", retentionDays: 1095, fileSpanMs: 86_400_000, maxSpanMs: Number.MAX_SAFE_INTEGER },
 ];
 /** The raw tier: unaggregated 1s samples, one segment file per hour. */
-const RAW_TIER = { windowMs: 1_000, label: "1s", key: "raw", fileSpanMs: 3_600_000, maxSpanMs: 60_000 };
+const RAW_TIER = { windowMs: 1_000, label: "1s", key: "raw", fileSpanMs: 3_600_000, maxSpanMs: 1_800_000 };
 const AGG_KEYS = ["usage", "workingSet", "anon", "file", "inactiveFile", "limit", "ratio", "cpu", "netRx", "netTx", "netRxPackets", "netTxPackets", "blkRead", "blkWrite", "pids"];
 /** Open (unfinalized) bucket per tier, per container. Finalized buckets go straight to segments. */
 const openBuckets = {};
@@ -799,11 +804,12 @@ function readRollupRange(container, tier, fromMs, toMs) {
     return parsePoints(listSegments(container, tier.key, tier.fileSpanMs, fromMs, toMs), isValidRollupPoint, fromMs, toMs);
 }
 /**
- * Serve a window: pick the tier by span (a 1min window gets 1s points,
- * a 3d window gets 1h points), read only that tier's segments
- * overlapping the window, and merge the tier's open bucket (the partial
- * current window, finalized on the fly). Bounded by construction: at
- * most ~156 points for any span.
+ * Serve a window: pick the tier by span (a 30m window gets 1s points,
+ * a 1d window gets 1min points, a 30d window gets 1h points), read
+ * only that tier's segments overlapping the window, and merge the
+ * tier's open bucket (the partial current window, finalized on the
+ * fly). Bounded by construction: at most 1800 points (a 30-minute
+ * window at 1s), and at least ~60 for every picker window.
  */
 function queryStats(container, spanMs, endMs) {
     const fromMs = endMs - spanMs;
